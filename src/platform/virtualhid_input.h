@@ -32,8 +32,9 @@ namespace platf::virtualhid {
      * @brief Construct the libvirtualhid input context using a selected backend.
      *
      * @param backend Backend used to create the libvirtualhid runtime.
+     * @param create_mouse Whether to create the shared libvirtualhid mouse.
      */
-    explicit input_context_t(lvh::BackendKind backend);
+    explicit input_context_t(lvh::BackendKind backend, bool create_mouse = true);
 
     /**
      * @brief Recreate the shared keyboard using the runtime's current driver and license state.

@@ -446,7 +446,7 @@ namespace platf::virtualhid {
   input_context_t::input_context_t():
       input_context_t {lvh::BackendKind::platform_default} {}
 
-  input_context_t::input_context_t(lvh::BackendKind backend):
+  input_context_t::input_context_t(lvh::BackendKind backend, bool create_mouse):
       runtime {create_runtime(backend)} {
     if (!runtime) {
       BOOST_LOG(warning) << "Unable to create libvirtualhid runtime"sv;
@@ -454,7 +454,9 @@ namespace platf::virtualhid {
     }
 
     refresh_keyboard();
-    refresh_mouse();
+    if (create_mouse) {
+      refresh_mouse();
+    }
   }
 
   void input_context_t::refresh_keyboard() {
@@ -1008,6 +1010,7 @@ namespace platf {
   }
 #endif
 
+#if !defined(_WIN32) || defined(SUNSHINE_TESTS)
   void move_mouse(input_t &input, int deltaX, int deltaY) {
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
   }
@@ -1027,6 +1030,7 @@ namespace platf {
   void hscroll(input_t &input, int high_res_distance) {
     virtualhid::hscroll(virtualhid::get_input_context(input), high_res_distance);
   }
+#endif
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
     virtualhid::keyboard_update(virtualhid::get_input_context(input), modcode, release, flags);

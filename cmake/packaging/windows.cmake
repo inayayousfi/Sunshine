@@ -1,5 +1,10 @@
 # windows specific packaging
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
+install(FILES "${HIDMAESTRO_MOUSE_DLL}" DESTINATION "." RENAME "HIDMaestro.NativeMouse.dll" COMPONENT application)
+
+add_custom_command(TARGET sunshine POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${HIDMAESTRO_MOUSE_DLL}" "$<TARGET_FILE_DIR:sunshine>/HIDMaestro.NativeMouse.dll")
 
 # Hardening: include zlib1.dll (loaded via LoadLibrary() in openssl's libcrypto.a)
 install(FILES "${ZLIB}" DESTINATION "." COMPONENT application)

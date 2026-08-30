@@ -51,7 +51,7 @@ namespace input {
   /**
    * @brief Initialize global input resources and platform backends.
    *
-   * @return Cleanup handle for initialized input resources, or null if none are required.
+   * @return Cleanup handle for initialized input resources, or null when the platform backend fails.
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init();
 
@@ -63,10 +63,10 @@ namespace input {
   bool probe_gamepads();
 
   /**
-   * @brief Recreate shared libvirtualhid keyboard and mouse devices after a license-state change.
+   * @brief Recreate shared libvirtualhid devices after a license-state change.
    *
-   * The work is serialized with streamed input so both backends can switch
-   * safely between the Windows HID and SendInput paths.
+   * The work is serialized with streamed input. On Windows, the mandatory
+   * HIDMaestro mouse is not affected by libvirtualhid license changes.
    */
   void refresh_virtual_input();
 

@@ -2077,6 +2077,9 @@ namespace input {
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
     platf_input = platf::input();
+    if (!platf_input) {
+      return nullptr;
+    }
 
     return std::make_unique<deinit_t>();
   }
@@ -2100,7 +2103,9 @@ namespace input {
         reset_keyboard_keys();
         auto &context = platf::virtualhid::get_input_context(platf_input);
         context.refresh_keyboard();
+#if !defined(_WIN32) || defined(SUNSHINE_TESTS)
         context.refresh_mouse();
+#endif
       }
     });
   }

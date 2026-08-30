@@ -17,7 +17,11 @@
 #include <Windows.h>
 
 // standard includes
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <memory>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -31,9 +35,48 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/virtualhid_input.h"
+#include "src/platform/windows/hidmaestro_mouse.h"
 
 namespace platf {
   using namespace std::literals;
+
+  int hidmaestro::normalize_absolute(float position, int dimension) {
+    if (dimension <= 1) {
+      return 0;
+    }
+    const auto clamped = std::clamp(position, 0.0f, static_cast<float>(dimension - 1));
+    return static_cast<int>(std::lround(clamped * 32767.0f / static_cast<float>(dimension - 1)));
+  }
+
+  std::uint32_t hidmaestro::translate_button(int button) {
+    switch (button) {
+      case BUTTON_LEFT:
+        return 1;
+      case BUTTON_RIGHT:
+        return 2;
+      case BUTTON_MIDDLE:
+        return 3;
+      case BUTTON_X1:
+        return 4;
+      case BUTTON_X2:
+        return 5;
+      default:
+        return 0;
+    }
+  }
+
+  std::vector<int> hidmaestro::scroll_chunks(int &remainder, int distance) {
+    const auto accumulated = static_cast<std::int64_t>(remainder) + distance;
+    auto detents = accumulated / 120;
+    remainder = static_cast<int>(accumulated % 120);
+    std::vector<int> chunks;
+    while (detents != 0) {
+      const auto chunk = static_cast<int>(std::clamp<std::int64_t>(detents, -127, 127));
+      chunks.push_back(chunk);
+      detents -= chunk;
+    }
+    return chunks;
+  }
 
   /**
    * @brief ViGEm client pointer released with `vigem_free`.
@@ -43,6 +86,132 @@ namespace platf {
    * @brief ViGEm target pointer released with `vigem_target_free`.
    */
   using target_t = util::safe_ptr<_VIGEM_TARGET_T, vigem_target_free>;
+
+  /**
+   * @brief Runtime-loaded HIDMaestro mouse API and virtual mouse handle.
+   */
+  struct hidmaestro_mouse_t {
+    using handle_t = void *;
+    using create_fn = handle_t(__cdecl *)();
+    using destroy_fn = int(__cdecl *)(handle_t);
+    using relative_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);
+    using absolute_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);
+    using button_fn = int(__cdecl *)(handle_t, std::uint32_t, int);
+    using scroll_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);
+    using last_error_fn = const char *(__cdecl *) ();
+
+    /**
+     * @brief Load HIDMaestro and create the mandatory virtual mouse.
+     *
+     * @param initialize Whether to load the production backend.
+     */
+    explicit hidmaestro_mouse_t(bool initialize = true) {
+      if (!initialize) {
+        return;
+      }
+      module = LoadLibraryExW(
+        L"HIDMaestro.NativeMouse.dll",
+        nullptr,
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+      );
+      if (!module) {
+        BOOST_LOG(fatal) << "Unable to load HIDMaestro.NativeMouse.dll: "sv << GetLastError();
+        return;
+      }
+
+      create = load<create_fn>("hidmaestro_mouse_create"sv);
+      destroy = load<destroy_fn>("hidmaestro_mouse_destroy"sv);
+      relative = load<relative_fn>("hidmaestro_mouse_relative"sv);
+      absolute = load<absolute_fn>("hidmaestro_mouse_absolute"sv);
+      button = load<button_fn>("hidmaestro_mouse_button"sv);
+      scroll = load<scroll_fn>("hidmaestro_mouse_scroll"sv);
+      last_error = load<last_error_fn>("hidmaestro_mouse_last_error"sv);
+      if (!create || !destroy || !relative || !absolute || !button || !scroll || !last_error) {
+        return;
+      }
+
+      handle = create();
+      if (!handle) {
+        BOOST_LOG(fatal) << "Unable to create HIDMaestro mouse: "sv << error();
+      }
+    }
+
+    hidmaestro_mouse_t(const hidmaestro_mouse_t &) = delete;
+    hidmaestro_mouse_t &operator=(const hidmaestro_mouse_t &) = delete;
+
+    /**
+     * @brief Destroy the virtual mouse before unloading its NativeAOT module.
+     */
+    ~hidmaestro_mouse_t() {
+      if (handle && destroy && destroy(handle) != 0) {
+        BOOST_LOG(error) << "Unable to destroy HIDMaestro mouse: "sv << error();
+      }
+      if (module) {
+        FreeLibrary(module);
+      }
+    }
+
+    /**
+     * @brief Check whether every export loaded and mouse creation succeeded.
+     *
+     * @return True when the mouse is ready for input.
+     */
+    explicit operator bool() const {
+      return handle != nullptr;
+    }
+
+    /**
+     * @brief Return the latest HIDMaestro error for the calling thread.
+     *
+     * @return Error text, or a fallback when no text is available.
+     */
+    const char *error() const {
+      if (last_error) {
+        if (const auto message = last_error()) {
+          return message;
+        }
+      }
+      return "no error details available";
+    }
+
+    /**
+     * @brief Submit accumulated high-resolution wheel input as HID detents.
+     *
+     * @param distance High-resolution wheel distance in 120-unit detents.
+     * @param horizontal Whether to submit on the horizontal axis.
+     */
+    void submit_scroll(int distance, bool horizontal) {
+      auto &remainder = horizontal ? horizontal_scroll_remainder : vertical_scroll_remainder;
+      for (const auto chunk : hidmaestro::scroll_chunks(remainder, distance)) {
+        const auto result = horizontal ? scroll(handle, 0, chunk) : scroll(handle, chunk, 0);
+        if (result != 0) {
+          BOOST_LOG(error) << "Unable to submit HIDMaestro mouse scroll: "sv << error();
+          return;
+        }
+      }
+    }
+
+    template<typename Function>
+    Function load(std::string_view name) {
+      const auto function = reinterpret_cast<Function>(GetProcAddress(module, name.data()));
+      if (!function) {
+        BOOST_LOG(fatal) << "Missing HIDMaestro export "sv << name;
+      }
+      return function;
+    }
+
+    HMODULE module = nullptr;  ///< NativeAOT DLL module.
+    handle_t handle = nullptr;  ///< Opaque HIDMaestro mouse handle.
+    create_fn create = nullptr;  ///< Mouse creation export.
+    destroy_fn destroy = nullptr;  ///< Mouse destruction export.
+    relative_fn relative = nullptr;  ///< Relative movement export.
+    absolute_fn absolute = nullptr;  ///< Absolute movement export.
+    button_fn button = nullptr;  ///< Button export.
+    scroll_fn scroll = nullptr;  ///< Scroll export.
+    last_error_fn last_error = nullptr;  ///< Error export.
+    int vertical_scroll_remainder = 0;  ///< Pending vertical high-resolution wheel units.
+    int horizontal_scroll_remainder = 0;  ///< Pending horizontal high-resolution wheel units.
+  };
 
   /**
    * @brief Handle Xbox 360 virtual gamepad notification events.
@@ -520,12 +689,28 @@ namespace platf {
    * @brief Global virtual input device handles shared by clients.
    */
   struct input_raw_t {
-    virtualhid::input_context_t virtualhid;  ///< libvirtualhid input context.
+#ifdef SUNSHINE_TESTS
+    input_raw_t():
+        virtualhid {lvh::BackendKind::platform_default},
+        mouse {false} {}
+#else
+    input_raw_t():
+        virtualhid {lvh::BackendKind::platform_default, false} {}
+#endif
+
+    virtualhid::input_context_t virtualhid;  ///< libvirtualhid non-mouse input context.
+    hidmaestro_mouse_t mouse;  ///< Mandatory HIDMaestro mouse context.
     std::unique_ptr<vigem_t> vigem;  ///< ViGEm fallback context.
   };
 
   input_t input() {
     input_t result {new input_raw_t {}};
+
+#ifndef SUNSHINE_TESTS
+    if (!result->mouse) {
+      return {};
+    }
+#endif
 
     if (auto &raw = *result; !raw.virtualhid.runtime || !raw.virtualhid.runtime->capabilities().supports_gamepad) {
       auto vigem = std::make_unique<vigem_t>();
@@ -570,6 +755,61 @@ namespace platf {
 
   virtualhid::input_context_t &virtualhid::get_input_context(input_t &input) {
     return input->virtualhid;
+  }
+
+  void move_mouse(input_t &input, int deltaX, int deltaY) {
+#ifdef SUNSHINE_TESTS
+    virtualhid::move_mouse(input->virtualhid, deltaX, deltaY);
+#else
+    auto &mouse = input->mouse;
+    if (mouse.relative(mouse.handle, deltaX, deltaY) != 0) {
+      BOOST_LOG(error) << "Unable to submit HIDMaestro relative mouse movement: "sv << mouse.error();
+    }
+#endif
+  }
+
+  void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
+#ifdef SUNSHINE_TESTS
+    virtualhid::abs_mouse(input->virtualhid, touch_port, x, y);
+#else
+    auto &mouse = input->mouse;
+    if (mouse.absolute(mouse.handle, hidmaestro::normalize_absolute(x, touch_port.width), hidmaestro::normalize_absolute(y, touch_port.height)) != 0) {
+      BOOST_LOG(error) << "Unable to submit HIDMaestro absolute mouse movement: "sv << mouse.error();
+    }
+#endif
+  }
+
+  void button_mouse(input_t &input, int button, bool release) {
+#ifdef SUNSHINE_TESTS
+    virtualhid::button_mouse(input->virtualhid, button, release);
+#else
+    const auto converted = hidmaestro::translate_button(button);
+    if (converted == 0) {
+      BOOST_LOG(warning) << "Unknown mouse button: "sv << button;
+      return;
+    }
+
+    auto &mouse = input->mouse;
+    if (mouse.button(mouse.handle, converted, release ? 0 : 1) != 0) {
+      BOOST_LOG(error) << "Unable to submit HIDMaestro mouse button: "sv << mouse.error();
+    }
+#endif
+  }
+
+  void scroll(input_t &input, int high_res_distance) {
+#ifdef SUNSHINE_TESTS
+    virtualhid::scroll(input->virtualhid, high_res_distance);
+#else
+    input->mouse.submit_scroll(high_res_distance, false);
+#endif
+  }
+
+  void hscroll(input_t &input, int high_res_distance) {
+#ifdef SUNSHINE_TESTS
+    virtualhid::hscroll(input->virtualhid, high_res_distance);
+#else
+    input->mouse.submit_scroll(high_res_distance, true);
+#endif
   }
 
   std::optional<util::point_t> get_mouse_loc(input_t & /*input*/) {
