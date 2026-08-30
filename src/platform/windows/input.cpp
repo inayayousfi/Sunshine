@@ -91,14 +91,14 @@ namespace platf {
    * @brief Runtime-loaded HIDMaestro mouse API and virtual mouse handle.
    */
   struct hidmaestro_mouse_t {
-    using handle_t = void *;
-    using create_fn = handle_t(__cdecl *)();
-    using destroy_fn = int(__cdecl *)(handle_t);
-    using relative_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);
-    using absolute_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);
-    using button_fn = int(__cdecl *)(handle_t, std::uint32_t, int);
-    using scroll_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);
-    using last_error_fn = const char *(__cdecl *) ();
+    using handle_t = void *;  ///< Opaque native mouse handle.
+    using create_fn = handle_t(__cdecl *)();  ///< Mouse creation export type.
+    using destroy_fn = int(__cdecl *)(handle_t);  ///< Mouse destruction export type.
+    using relative_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);  ///< Relative movement export type.
+    using absolute_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);  ///< Absolute movement export type.
+    using button_fn = int(__cdecl *)(handle_t, std::uint32_t, int);  ///< Button export type.
+    using scroll_fn = int(__cdecl *)(handle_t, std::int32_t, std::int32_t);  ///< Scroll export type.
+    using last_error_fn = const char *(__cdecl *) ();  ///< Error retrieval export type.
 
     /**
      * @brief Load HIDMaestro and create the mandatory virtual mouse.
@@ -109,12 +109,12 @@ namespace platf {
       if (!initialize) {
         return;
       }
-      module = LoadLibraryExW(
+      library = LoadLibraryExW(
         L"HIDMaestro.NativeMouse.dll",
         nullptr,
         LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
       );
-      if (!module) {
+      if (!library) {
         BOOST_LOG(fatal) << "Unable to load HIDMaestro.NativeMouse.dll: "sv << GetLastError();
         return;
       }
@@ -132,7 +132,7 @@ namespace platf {
 
       handle = create();
       if (!handle) {
-        BOOST_LOG(fatal) << "Unable to create HIDMaestro mouse: "sv << error();
+        BOOST_LOG(fatal) << "Unable to create HIDMaestro mouse: "sv << message();
       }
     }
 
@@ -144,10 +144,10 @@ namespace platf {
      */
     ~hidmaestro_mouse_t() {
       if (handle && destroy && destroy(handle) != 0) {
-        BOOST_LOG(error) << "Unable to destroy HIDMaestro mouse: "sv << error();
+        BOOST_LOG(error) << "Unable to destroy HIDMaestro mouse: "sv << message();
       }
-      if (module) {
-        FreeLibrary(module);
+      if (library) {
+        FreeLibrary(library);
       }
     }
 
@@ -165,7 +165,7 @@ namespace platf {
      *
      * @return Error text, or a fallback when no text is available.
      */
-    const char *error() const {
+    const char *message() const {
       if (last_error) {
         if (const auto message = last_error()) {
           return message;
@@ -185,22 +185,29 @@ namespace platf {
       for (const auto chunk : hidmaestro::scroll_chunks(remainder, distance)) {
         const auto result = horizontal ? scroll(handle, 0, chunk) : scroll(handle, chunk, 0);
         if (result != 0) {
-          BOOST_LOG(error) << "Unable to submit HIDMaestro mouse scroll: "sv << error();
+          BOOST_LOG(error) << "Unable to submit HIDMaestro mouse scroll: "sv << message();
           return;
         }
       }
     }
 
+    /**
+     * @brief Load a required function from the NativeAOT library.
+     *
+     * @tparam Function Function pointer type.
+     * @param name Export name.
+     * @return Loaded function, or null when the export is unavailable.
+     */
     template<typename Function>
     Function load(std::string_view name) {
-      const auto function = reinterpret_cast<Function>(GetProcAddress(module, name.data()));
+      const auto function = reinterpret_cast<Function>(GetProcAddress(library, name.data()));
       if (!function) {
         BOOST_LOG(fatal) << "Missing HIDMaestro export "sv << name;
       }
       return function;
     }
 
-    HMODULE module = nullptr;  ///< NativeAOT DLL module.
+    HMODULE library = nullptr;  ///< NativeAOT DLL library handle.
     handle_t handle = nullptr;  ///< Opaque HIDMaestro mouse handle.
     create_fn create = nullptr;  ///< Mouse creation export.
     destroy_fn destroy = nullptr;  ///< Mouse destruction export.
@@ -763,7 +770,7 @@ namespace platf {
 #else
     auto &mouse = input->mouse;
     if (mouse.relative(mouse.handle, deltaX, deltaY) != 0) {
-      BOOST_LOG(error) << "Unable to submit HIDMaestro relative mouse movement: "sv << mouse.error();
+      BOOST_LOG(error) << "Unable to submit HIDMaestro relative mouse movement: "sv << mouse.message();
     }
 #endif
   }
@@ -774,7 +781,7 @@ namespace platf {
 #else
     auto &mouse = input->mouse;
     if (mouse.absolute(mouse.handle, hidmaestro::normalize_absolute(x, touch_port.width), hidmaestro::normalize_absolute(y, touch_port.height)) != 0) {
-      BOOST_LOG(error) << "Unable to submit HIDMaestro absolute mouse movement: "sv << mouse.error();
+      BOOST_LOG(error) << "Unable to submit HIDMaestro absolute mouse movement: "sv << mouse.message();
     }
 #endif
   }
@@ -791,7 +798,7 @@ namespace platf {
 
     auto &mouse = input->mouse;
     if (mouse.button(mouse.handle, converted, release ? 0 : 1) != 0) {
-      BOOST_LOG(error) << "Unable to submit HIDMaestro mouse button: "sv << mouse.error();
+      BOOST_LOG(error) << "Unable to submit HIDMaestro mouse button: "sv << mouse.message();
     }
 #endif
   }

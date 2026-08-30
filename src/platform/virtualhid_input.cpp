@@ -1010,7 +1010,7 @@ namespace platf {
   }
 #endif
 
-#if !defined(_WIN32) || defined(SUNSHINE_TESTS)
+#ifndef _WIN32
   void move_mouse(input_t &input, int deltaX, int deltaY) {
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
   }

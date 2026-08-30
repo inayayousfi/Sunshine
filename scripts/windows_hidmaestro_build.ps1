@@ -10,7 +10,7 @@ a restore script under ProgramData.
 #>
 [CmdletBinding()]
 param(
-    [string]$BuildRoot = "$env:LOCALAPPDATA\Sunshine-HIDMaestro-Build",
+    [string]$BuildRoot = 'C:\hmb',
     [string]$InstallDir = "$env:ProgramFiles\Sunshine"
 )
 
@@ -110,6 +110,7 @@ $packages = @(
     'mingw-w64-ucrt-x86_64-cmake',
     'mingw-w64-ucrt-x86_64-cppwinrt',
     'mingw-w64-ucrt-x86_64-curl-winssl',
+    'mingw-w64-ucrt-x86_64-doxygen',
     'mingw-w64-ucrt-x86_64-gcc',
     'mingw-w64-ucrt-x86_64-graphviz',
     'mingw-w64-ucrt-x86_64-miniupnpc',
@@ -131,10 +132,26 @@ if (Test-Path $BuildRoot) {
 }
 New-Item -ItemType Directory -Path $BuildRoot | Out-Null
 
+$nodeVersion = '22.23.2'
+$nodeArchive = Join-Path $BuildRoot "node-v$nodeVersion-win-x64.zip"
+$nodeRoot = Join-Path $BuildRoot "node-v$nodeVersion-win-x64"
+Invoke-WebRequest "https://nodejs.org/dist/v$nodeVersion/node-v$nodeVersion-win-x64.zip" -OutFile $nodeArchive
+$nodeHash = (Get-FileHash $nodeArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($nodeHash -ne '1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97') {
+    throw "Unexpected Node.js archive hash: $nodeHash"
+}
+Expand-Archive $nodeArchive -DestinationPath $BuildRoot
+$npmWrapper = Join-Path $nodeRoot 'npm-sunshine.cmd'
+Set-Content -Path $npmWrapper -Encoding ASCII -Value @(
+    '@echo off',
+    'set "PATH=%~dp0;%PATH%"',
+    '"%~dp0npm.cmd" %*'
+)
+
 $hidRoot = Join-Path $BuildRoot 'HIDMaestro'
 $sunshineRoot = Join-Path $BuildRoot 'Sunshine'
-Invoke-Checked git.exe clone --branch feature/sunshine-mouse-native --single-branch https://github.com/inayayousfi/HIDMaestro.git $hidRoot
-Invoke-Checked git.exe clone --branch feature/hidmaestro-mouse --single-branch --recurse-submodules https://github.com/inayayousfi/Sunshine.git $sunshineRoot
+Invoke-Checked git.exe -c core.longpaths=true clone --branch feature/sunshine-mouse-native --single-branch https://github.com/inayayousfi/HIDMaestro.git $hidRoot
+Invoke-Checked git.exe -c core.longpaths=true clone --branch feature/hidmaestro-mouse --single-branch --recurse-submodules https://github.com/inayayousfi/Sunshine.git $sunshineRoot
 
 Invoke-Checked cmd.exe /c (Join-Path $hidRoot 'scripts\build_all.cmd')
 $nativeProject = Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\HIDMaestro.NativeMouse.csproj'
@@ -146,7 +163,8 @@ $stagingDir = Join-Path $BuildRoot 'staging'
 Push-Location $sunshineRoot
 try {
     $cmakeDll = $nativeDll.Replace('\', '/')
-    Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c "cmake -B cmake-build-hidmaestro -G Ninja -S . -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DHIDMAESTRO_MOUSE_DLL='$cmakeDll'"
+    $cmakeNpm = $npmWrapper.Replace('\', '/')
+    Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c "cmake -B cmake-build-hidmaestro -G Ninja -S . -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DDOTNET_EXECUTABLE=OFF -DHIDMAESTRO_MOUSE_DLL='$cmakeDll' -DNPM='$cmakeNpm'"
     Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c 'cmake --build cmake-build-hidmaestro'
     Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c './cmake-build-hidmaestro/tests/test_sunshine.exe'
     $cmakeStaging = $stagingDir.Replace('\', '/')
@@ -183,8 +201,19 @@ New-Item -ItemType Directory -Path (Split-Path $restorePath) -Force | Out-Null
 Set-Content -Path $restorePath -Value $restore -Encoding UTF8
 
 if ($service) {
-    Start-Service SunshineService
-    (Get-Service SunshineService).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+    try {
+        Start-Service SunshineService
+        (Get-Service SunshineService).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+        Start-Sleep -Seconds 15
+        if (-not (Get-Process sunshine -ErrorAction SilentlyContinue)) {
+            throw 'Sunshine exited during startup.'
+        }
+    } catch {
+        Stop-Service SunshineService -Force -ErrorAction SilentlyContinue
+        Invoke-Robocopy $backupDir $InstallDir -Mirror
+        Start-Service SunshineService
+        throw "HIDMaestro deployment failed and the previous Sunshine installation was restored: $_"
+    }
 }
 
 Write-Host "Installed HIDMaestro Sunshine to $InstallDir"
