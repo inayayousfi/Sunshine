@@ -36,9 +36,6 @@ public static class DeviceManager
     [DllImport("CfgMgr32.dll")]
     static extern uint CM_Unregister_Notification(IntPtr NotifyContext);
 
-    [DllImport("CfgMgr32.dll")]
-    static extern uint CM_Get_DevNode_Status(out uint pulStatus, out uint pulProblemNumber, uint dnDevInst, uint ulFlags);
-
     [DllImport("CfgMgr32.dll", CharSet = CharSet.Unicode)]
     static extern uint CM_Get_Device_ID_Size(out uint pulLen, uint dnDevInst, uint ulFlags);
 
@@ -54,7 +51,6 @@ public static class DeviceManager
     const uint CM_NOTIFY_ACTION_DEVICEINSTANCEREMOVED = 9;
 
     const uint CR_SUCCESS = 0;
-    const uint DN_STARTED = 0x00000008;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct CM_NOTIFY_FILTER
@@ -306,10 +302,7 @@ public static class DeviceManager
     /// guarantees a fresh devnode every create, but Windows preserves a
     /// per-instance registry hive entry indefinitely after teardown.
     /// Across many sessions these accumulate as "hidden devices" in
-    /// Device Manager. They are functionally harmless (no XInput slot,
-    /// no joy.cpl/WGI/RawInput/SDL3 visibility, only surfaced by
-    /// "Show Hidden Devices") but visually clutter Device Manager for
-    /// power users running many sessions per boot.
+    /// Device Manager.
     ///
     /// SetupDiRemoveDevice via DIGCF_ALLCLASSES enumerator is the
     /// documented path that actually deletes the registry hive cache
@@ -395,20 +388,13 @@ public static class DeviceManager
 
     /// <summary>
     /// Returns true when the PnP devnode at <paramref name="instanceId"/> carries
-    /// a HIDMaestro-signature HardwareID — i.e. one of `root\HIDMaestro`,
-    /// `root\HIDMaestroGamepad`, `root\HIDMaestroXUSB` (or any future
-    /// `*HIDMaestro*` literal). Every HM-created devnode writes one of those
-    /// strings into its HardwareID multi-sz at SetupDi-create time (plain HID
-    /// at DeviceNodeCreator.cs:121, gamepad companion at
-    /// DeviceOrchestrator.cs:889-894, XUSB at DeviceOrchestrator.cs:1019-1020),
-    /// so the presence of "HIDMaestro" in HardwareID is the ownership proof
-    /// every sweep needs before disabling / uninstalling / renaming /
-    /// property-writing a node.
+    /// a HIDMaestro-signature HardwareID. Every mouse devnode includes
+    /// `root\HIDMaestro` in its HardwareID multi-sz, so the presence of
+    /// "HIDMaestro" is the ownership proof every sweep needs before
+    /// disabling or uninstalling a node.
     ///
-    /// <para>Issue #28 (v1.3.16): without this guard the
-    /// <c>CleanupGhostDevices</c> / <c>SetBusTypeGuidUsb</c> /
-    /// <c>RemoveAllVirtualControllers</c> / <c>DisableGhostXusbInterfaces</c>
-    /// sweeps selected by instance-path pattern alone and ran their
+    /// <para>Without this guard, sweeps selected by instance-path pattern
+    /// alone could run their
     /// destructive operations against whatever matched — disabling a
     /// coexisting vJoy root HIDClass device, mutating ViGEmBus / HidHide
     /// SYSTEM nodes, or removing third-party root-enumerated VID_ devices
@@ -454,106 +440,14 @@ public static class DeviceManager
         // Any devices that survive as phantoms get caught by the ghost
         // cleanup at the start of the next SetupController run.
 
-        bool isSwdParent = instanceId.StartsWith("SWD\\", StringComparison.OrdinalIgnoreCase);
-
-        // For SWD parents, close the SwDevice handle FIRST, then mop up
-        // surviving children. HID children of an SwD parent cannot fully
-        // unwind until the parent's HSWDEVICE handle releases its kernel
-        // refcount (DIF_REMOVE on the child completes the handle/PDO
-        // detach but the queries can't drain while the parent still
-        // holds the lifetime lock). The pre-fix child-first order paid
-        // 2000ms per HID child on WaitForDeviceRemoval (timed out, child
-        // didn't actually go), then the parent close took 55ms and
-        // cascaded the children automatically. Net: ~5.4s per SWD
-        // teardown for one HID child, scaling worse with more children.
-        // Post-fix: parent close first (~55ms), child-survivor sweep is
-        // a fast no-op for the typical case where Windows already
-        // cascade-removed them with the SwD parent.
         var childIds = GetAllChildDeviceIds(devInst);
         bool goneAfterDif = false;
-
-        // For SWD parents that are PHANTOM-only (registry residue, no live
-        // devnode), skip the hmswd.exe roundtrip — there's no live device
-        // to terminate. Each helper spawn costs ~50-75 ms with no useful
-        // work; over a 5-cycle Xbox 360 wired probe the sweep accumulates
-        // 4 phantoms by cycle 5, adding ~250 ms to that teardown for
-        // nothing. Detect via CM_Locate_DevNodeW NORMAL (mode 0) returning
-        // failure while PHANTOM (mode 1) succeeds — the early-bail at the
-        // top of this function only fires when BOTH fail, so we still got
-        // here for phantom-only entries.
-        bool isLive = CM_Locate_DevNodeW(out _, instanceId, 0) == CR_SUCCESS;
-        if (isSwdParent && !fast && !isLive)
-        {
-            DeviceOrchestrator.LogDiag($"      SwdDeviceFactory.Remove({instanceId}) SKIPPED (phantom-only registry residue)");
-            goneAfterDif = true;
-        }
-        else if (isSwdParent && fast && isLive)
-        {
-            // Force-close recovery fix (2026-07-21): fast mode must still
-            // use the SwD lifetime terminator. The CM_Disable/CM_Uninstall
-            // pair below is documented (above) as transient-and-slow for a
-            // SwDeviceLifetimeParentPresent device whose orphaned WUDFHost
-            // is still up: the devnode lingered 6-17 s per device in the
-            // force-close recovery measurements, and the sequential sweep
-            // in RemoveAllVirtualControllers summed to ~40 s for a
-            // 360-wired + series-bt pair. SwdDeviceFactory.Remove is the
-            // empirically-verified terminator (reconnect + lifetime=Handle
-            // + SwDeviceClose, see the !fast branch below): the handle
-            // close starts the SAME kernel cascade a graceful consumer
-            // close does (~1-2 s for all devices, per PadForge's normal
-            // exit). Fast semantics are preserved: no WaitForDeviceRemoval
-            // here; the cascade completes asynchronously and Step 2's CM
-            // sweep below remains as belt-and-braces for survivors.
-            var swFastSw = System.Diagnostics.Stopwatch.StartNew();
-            int hrFast = SwdDeviceFactory.Remove(instanceId);
-            DeviceOrchestrator.LogDiag(
-                $"      SwdDeviceFactory.Remove({instanceId}) hr=0x{hrFast:X8} " +
-                $"(fast mode, no removal wait) in {swFastSw.ElapsedMilliseconds}ms");
-        }
-        else if (isSwdParent && !fast)
-        {
-            // SwDevice teardown via the documented lifetime-downgrade path.
-            // DIF_REMOVE on a SwDeviceLifetimeParentPresent device is
-            // transient on Win11 26200 — the kernel re-enumerates the
-            // devnode within 5-30s because HTREE\ROOT\0 (the parent) is
-            // always present. SwDeviceCreate-reconnect + lifetime=Handle
-            // + SwDeviceClose is the only way to actually terminate the
-            // lifetime contract. Verified empirically 2026-04-25 against
-            // a resurrected BT SwDevice: device transitioned to PHANTOM
-            // and stayed PHANTOM for 20+ seconds (vs DIF_REMOVE+pnputil-
-            // /force which let it resurrect within 10s).
-            //
-            // SwdDeviceFactory.Remove returns when the HSWDEVICE handle
-            // closes — NOT when the kernel has finished propagating the
-            // devnode removal through the PnP tree. We must block on a
-            // CM_NOTIFY_ACTION_DEVICEINSTANCEREMOVED event for the
-            // instance to guarantee the device is fully offline before
-            // proceeding to children/cleanup. CM_Locate_DevNodeW
-            // immediately after Remove() commonly returns "still present"
-            // (verified in the 09:21:18 diag log: present=True after
-            // 56 ms hr=0x0).
-            var swSw = System.Diagnostics.Stopwatch.StartNew();
-            int hr = SwdDeviceFactory.Remove(instanceId);
-            // Block until the kernel actually fires the device-removed
-            // notification — or the timeout expires. Use the caller's
-            // timeoutMs budget so callers explicitly choose how long to
-            // wait. Live-swap callers pass 120_000 ms (the full BT
-            // xinputhid cascade budget); cleanup paths may pass less.
-            goneAfterDif = WaitForDeviceRemoval(instanceId, timeoutMs);
-            DeviceOrchestrator.LogDiag($"      SwdDeviceFactory.Remove({instanceId}) hr=0x{hr:X8} confirmed_offline={goneAfterDif} after {swSw.ElapsedMilliseconds}ms");
-        }
 
         // Step 1: Find and remove all children. For SWD parents this
         // typically becomes a no-op because the SwD close already
         // cascade-removed them.
         foreach (string childId in childIds)
         {
-            // Skip if the SwD-parent close already cascaded this child away.
-            if (isSwdParent && !fast
-                && CM_Locate_DevNodeW(out _, childId, 0) != CR_SUCCESS
-                && CM_Locate_DevNodeW(out _, childId, 1) != CR_SUCCESS)
-                continue;
-
             if (fast)
             {
                 // Fast mode: CM_Disable + CM_Uninstall directly. Avoids the
@@ -574,19 +468,12 @@ public static class DeviceManager
             }
         }
 
-        // Step 2: Remove the parent (for non-SWD; SWD already done above)
+        // Step 2: Remove the ROOT parent.
         if (fast)
         {
             CM_Disable_DevNode(devInst, 0);
             CM_Uninstall_DevNode(devInst, 0);
             goneAfterDif = false; // don't wait, don't confirm
-        }
-        else if (isSwdParent)
-        {
-            // Already removed at the top of the function. Re-check in case
-            // a survivor sweep above kicked the parent into a transient
-            // state.
-            goneAfterDif = CM_Locate_DevNodeW(out _, instanceId, 0) != CR_SUCCESS;
         }
         else
         {
@@ -849,52 +736,6 @@ public static class DeviceManager
     [DllImport("CfgMgr32.dll")]
     static extern uint CM_Disable_DevNode(uint dnDevInst, uint ulFlags);
 
-    [DllImport("CfgMgr32.dll")]
-    static extern uint CM_Enable_DevNode(uint dnDevInst, uint ulFlags);
-
-    /// <summary>
-    /// Restarts a device by disabling and re-enabling it. No process spawning.
-    /// </summary>
-    public static bool RestartDevice(string instanceId)
-    {
-        if (CM_Locate_DevNodeW(out uint devInst, instanceId, 0) != CR_SUCCESS)
-            return false;
-        CM_Disable_DevNode(devInst, 0);
-        // Wait for driver to unload before re-enabling. The 5 s base is
-        // a backstop — WaitForDeviceRemoval is signal-driven internally
-        // via CM_Register_Notification, this just caps the wait.
-        // WaitForDeviceRemoval applies TimeoutScale internally.
-        WaitForDeviceRemoval(instanceId, 5000);
-        // Re-locate (may have become phantom after disable)
-        CM_Locate_DevNodeW(out devInst, instanceId, 1); // phantom flag
-        CM_Enable_DevNode(devInst, 0);
-        return true;
-    }
-
-    /// <summary>
-    /// Returns true if the device (or its HID child) is in DN_STARTED state,
-    /// meaning its driver is fully bound and the device is functional.
-    /// Used by FinalizeNames to poll for PnP readiness instead of fixed sleeps.
-    /// </summary>
-    public static bool IsDeviceStarted(string instanceId)
-    {
-        // Check the device itself first
-        if (CM_Locate_DevNodeW(out uint devInst, instanceId, 0) != CR_SUCCESS)
-            return false;
-        if (CM_Get_DevNode_Status(out uint status, out _, devInst, 0) == CR_SUCCESS
-            && (status & DN_STARTED) != 0)
-            return true;
-
-        // Also check the HID child (if any) — for virtual controllers the parent
-        // may be started but the HID child (where xinputhid binds) is what matters.
-        string? hidChild = GetHidChildId(instanceId);
-        if (hidChild == null) return false;
-        if (CM_Locate_DevNodeW(out uint childInst, hidChild, 0) != CR_SUCCESS)
-            return false;
-        return CM_Get_DevNode_Status(out uint childStatus, out _, childInst, 0) == CR_SUCCESS
-            && (childStatus & DN_STARTED) != 0;
-    }
-
     /// <summary>
     /// Finds the HID child device instance ID for a given parent.
     /// Returns null if no child found.
@@ -949,16 +790,11 @@ public static class DeviceManager
 
     /// <summary>
     /// Scans HKLM\SYSTEM\CurrentControlSet\Enum\HID for orphaned HM HID
-    /// children whose parent (ROOT\ or SWD\) no longer exists. Removes each
+    /// children whose ROOT parent no longer exists. Removes each
     /// via DIF_REMOVE. Returns the number of orphans removed.
     ///
     /// HM ownership is identified by the HardwareIDs of the HID instance —
-    /// every HM HID child carries "HID\HIDMaestro" + "HID\HIDMaestroGamepad"
-    /// entries from the INF. That's contractual and stable across:
-    ///   - the v1.1.20 ROOT\ -> SWD\ enumerator migration
-    ///   - VID-spoofing Xbox profiles vs HIDMAESTRO-prefix non-Xbox profiles
-    /// — so it correctly catches every flavor of HM child without name-
-    /// pattern brittleness.
+    /// every HM HID child carries the HIDMaestro hardware ID from the INF.
     /// </summary>
     public static int RemoveOrphanHidChildren()
     {

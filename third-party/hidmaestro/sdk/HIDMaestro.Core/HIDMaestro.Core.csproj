@@ -18,7 +18,8 @@
     <HMWdkBin>C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\</HMWdkBin>
   </PropertyGroup>
 
-  <Target Name="PackResources" BeforeTargets="BeforeBuild">
+  <Target Name="PackResources" BeforeTargets="BeforeBuild"
+          Condition="'$(SkipHidMaestroResourcePacking)' != 'true'">
     <MakeDir Directories="$(MSBuildThisFileDirectory)Resources" />
 
     <ItemGroup>
