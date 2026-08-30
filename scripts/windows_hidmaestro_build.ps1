@@ -3,10 +3,10 @@
 Build and deploy the HIDMaestro-backed Sunshine fork on Windows x64.
 
 .DESCRIPTION
-Installs missing build prerequisites, clones fresh copies of both fork branches,
-builds HIDMaestro and Sunshine, runs Sunshine tests, backs up the installed
-Sunshine directory, deploys the fork without touching configuration, and writes
-a restore script under ProgramData.
+Installs missing build prerequisites, builds the vendored HIDMaestro source and
+Sunshine checkout, runs Sunshine tests, backs up the installed Sunshine
+directory, deploys the fork without touching configuration, and writes a restore
+script under ProgramData.
 #>
 [CmdletBinding()]
 param(
@@ -16,6 +16,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$sunshineRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$hidRoot = Join-Path $sunshineRoot 'third-party\hidmaestro'
+
+if (-not (Test-Path (Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\HIDMaestro.NativeMouse.csproj'))) {
+    throw "The vendored HIDMaestro source is missing from $hidRoot."
+}
 
 function Invoke-Checked {
     param(
@@ -71,7 +77,6 @@ if (-not (Test-Administrator)) {
     exit $process.ExitCode
 }
 
-Ensure-WingetPackage 'Git.Git'
 Ensure-WingetPackage 'Microsoft.DotNet.SDK.10'
 Ensure-WingetPackage 'MSYS2.MSYS2'
 
@@ -148,18 +153,24 @@ Set-Content -Path $npmWrapper -Encoding ASCII -Value @(
     '"%~dp0npm.cmd" %*'
 )
 
-$hidRoot = Join-Path $BuildRoot 'HIDMaestro'
-$sunshineRoot = Join-Path $BuildRoot 'Sunshine'
-Invoke-Checked git.exe -c core.longpaths=true clone --branch feature/sunshine-mouse-native --single-branch https://github.com/inayayousfi/HIDMaestro.git $hidRoot
-Invoke-Checked git.exe -c core.longpaths=true clone --branch feature/hidmaestro-mouse --single-branch --recurse-submodules https://github.com/inayayousfi/Sunshine.git $sunshineRoot
-
-Invoke-Checked cmd.exe /c (Join-Path $hidRoot 'scripts\build_all.cmd')
+$driverBuild = Join-Path $hidRoot 'scripts\build.cmd'
+Remove-Item (Join-Path $hidRoot 'build') -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $hidRoot 'sdk\HIDMaestro.Core\Resources') -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $hidRoot 'sdk\HIDMaestro.Core\bin') -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $hidRoot 'sdk\HIDMaestro.Core\obj') -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\bin') -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\obj') -Recurse -Force -ErrorAction SilentlyContinue
+Invoke-Checked cmd.exe /c $driverBuild
+$coreProject = Join-Path $hidRoot 'sdk\HIDMaestro.Core\HIDMaestro.Core.csproj'
+Invoke-Checked dotnet.exe build $coreProject -c Release
+Invoke-Checked dotnet.exe build $coreProject -c Release --no-restore
 $nativeProject = Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\HIDMaestro.NativeMouse.csproj'
 Invoke-Checked dotnet.exe publish $nativeProject -c Release -r win-x64
 $nativeDll = Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\bin\Release\net10.0-windows10.0.26100.0\win-x64\publish\HIDMaestro.NativeMouse.dll'
 
 $buildDir = Join-Path $sunshineRoot 'cmake-build-hidmaestro'
 $stagingDir = Join-Path $BuildRoot 'staging'
+Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue
 Push-Location $sunshineRoot
 try {
     $cmakeDll = $nativeDll.Replace('\', '/')

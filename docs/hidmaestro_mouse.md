@@ -1,8 +1,10 @@
 # HIDMaestro Mouse Backend
 
-This fork replaces Sunshine's Windows mouse backend with
+This fork replaces Sunshine's Windows mouse backend with an in-tree snapshot of
 [HIDMaestro](https://github.com/inayayousfi/HIDMaestro). Keyboard, touch, pen,
-gamepad, and every non-Windows input path retain their existing backends.
+gamepad, and every non-Windows input path retain their existing backends. The
+vendored source is pinned in `third-party/hidmaestro`; building and deploying
+this branch does not clone or track another repository or feature branch.
 
 ## Behavior
 
@@ -26,11 +28,11 @@ host:
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\windows_hidmaestro_build.ps1
 ```
 
-The script installs missing prerequisites, clones fresh copies of the moving fork
-branches under `%LOCALAPPDATA%\Sunshine-HIDMaestro-Build`, builds both projects,
-runs the Sunshine test executable, backs up the current installation, and deploys
-the fork. Existing Sunshine configuration, applications, certificates, and
-Moonlight pairings are left in place.
+The script installs missing prerequisites, builds the vendored HIDMaestro source
+and the current Sunshine checkout, runs the Sunshine test executable, backs up
+the current installation, and deploys the fork. Temporary build and staging
+files are written under `C:\hmb`. Existing Sunshine configuration, applications,
+certificates, and Moonlight pairings are left in place.
 
 If a prerequisite requires a reboot, the script stops before changing Sunshine
 and prints the exact rerun command. It never reboots automatically.

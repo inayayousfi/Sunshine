@@ -1,0 +1,21 @@
+build/
+sdk/HIDMaestro.Core/bin/
+sdk/HIDMaestro.Core/obj/
+sdk/HIDMaestro.NativeMouse/bin/
+sdk/HIDMaestro.NativeMouse/obj/
+# Resources/ is populated by csproj <PackResources> target before build
+sdk/HIDMaestro.Core/Resources/
+*.cer
+*.cat
+*.user
+*.suo
+*.obj
+*.log
+*.log.*
+.vs/
+publish_out/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
