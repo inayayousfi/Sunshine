@@ -19,6 +19,14 @@ five buttons, vertical scrolling, and horizontal AC Pan. Relative and absolute
 reports use separate HID Mouse application collections because the Windows mouse
 class driver rejects both pointer modes in one collection.
 
+Mouse reports cross the SDK/driver boundary through an ordered 64-slot shared
+memory queue. The producer waits up to one second when the queue is full instead
+of overwriting unread input; a stalled driver is reported as an explicit
+submission error. The driver completes the first pending report immediately and
+paces an existing backlog at one report per millisecond. This preserves every
+submitted movement while avoiding the burst collapse observed when the complete
+backlog was handed to the Windows mouse stack at once.
+
 ## Build And Install
 
 Run the following from an Administrator PowerShell prompt on the Windows x64
@@ -28,10 +36,15 @@ host:
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\windows_hidmaestro_build.ps1
 ```
 
-The script installs missing prerequisites, builds the vendored HIDMaestro source
-and the current Sunshine checkout, runs the Sunshine test executable, backs up
-the current installation, and deploys the fork. Temporary build and staging
-files are written under `C:\hmb`. Existing Sunshine configuration, applications,
+The script installs missing prerequisites, builds the vendored HIDMaestro source,
+the pinned libvirtualhid Windows driver and broker, and the current Sunshine
+checkout. It runs every Sunshine test except
+`EncoderVariants/EncoderTest.ValidateEncoder/*`, whose encoder probe terminates
+the non-interactive Windows test process before Google Test can report a result.
+It then stops the affected services, backs up both installations and the active
+HIDMaestro driver package, deploys the matched components, and checks that
+Sunshine remains running. Temporary build and staging files are written under
+`C:\hmb\sunshine-hidmaestro`. Existing Sunshine configuration, applications,
 certificates, and Moonlight pairings are left in place.
 
 If a prerequisite requires a reboot, the script stops before changing Sunshine
@@ -45,8 +58,12 @@ The latest deployment writes a restore command to:
 %ProgramData%\Sunshine-HIDMaestro\restore.ps1
 ```
 
-Run it from Administrator PowerShell to stop the service, restore the complete
-pre-deployment installation, and restart Sunshine:
+Run it from Administrator PowerShell to restore the pre-deployment Sunshine and
+libvirtualhid program files, HIDMaestro driver package, driver manifest hash, and
+original service states. The restore package includes the libvirtualhid installer
+scripts and HIDMaestro DriverStore files, so it does not depend on the source
+checkout remaining available. Sunshine's live `config` directory is excluded
+from mirror operations and remains unchanged during both deployment and restore:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File "$env:ProgramData\Sunshine-HIDMaestro\restore.ps1"

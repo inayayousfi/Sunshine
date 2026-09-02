@@ -9,8 +9,8 @@ public sealed class HMController : IDisposable
     private readonly HMContext _context;
     private readonly IntPtr _inputView;
     private readonly IntPtr _inputEvent;
+    private readonly IntPtr _inputSpaceEvent;
     private readonly byte[] _report = new byte[HMMouseState.ReportSize];
-    private uint _inputSeqNo;
     private bool _disposed;
 
     internal int Index { get; }
@@ -25,6 +25,7 @@ public sealed class HMController : IDisposable
         Profile = profile;
         _inputView = SharedMemoryIO.EnsureInputMapping(index);
         _inputEvent = SharedMemoryIO.GetInputEvent(index);
+        _inputSpaceEvent = SharedMemoryIO.GetInputSpaceEvent(index);
     }
 
     /// <summary>Submits one relative mouse report.</summary>
@@ -46,7 +47,7 @@ public sealed class HMController : IDisposable
     private void SubmitReport()
     {
         SharedMemoryIO.WriteInputFrame(
-            _inputView, _inputEvent, ref _inputSeqNo,
+            _inputView, _inputEvent, _inputSpaceEvent,
             Array.Empty<byte>(), 0,
             extendedData: _report, extendedLen: _report.Length);
     }

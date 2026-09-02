@@ -82,6 +82,39 @@ namespace input {
 #ifdef SUNSHINE_TESTS
   namespace testing {
     /**
+     * @brief Test relative mouse batching without routing a packet through the input worker.
+     *
+     * @param dest_x Initial horizontal delta.
+     * @param dest_y Initial vertical delta.
+     * @param src_x Horizontal delta to add.
+     * @param src_y Vertical delta to add.
+     * @param result_x Receives the batched horizontal delta when batching succeeds.
+     * @param result_y Receives the batched vertical delta when batching succeeds.
+     * @return True when both sums fit in signed 16-bit values.
+     */
+    bool batch_relative_mouse(std::int16_t dest_x, std::int16_t dest_y, std::int16_t src_x, std::int16_t src_y, std::int16_t &result_x, std::int16_t &result_y);
+
+    /**
+     * @brief Test vertical wheel batching without routing a packet through the input worker.
+     *
+     * @param dest Initial wheel distance.
+     * @param src Wheel distance to add.
+     * @param result Receives the batched distance when batching succeeds.
+     * @return True when the sum fits in a signed 16-bit value.
+     */
+    bool batch_vertical_scroll(std::int16_t dest, std::int16_t src, std::int16_t &result);
+
+    /**
+     * @brief Test horizontal wheel batching without routing a packet through the input worker.
+     *
+     * @param dest Initial wheel distance.
+     * @param src Wheel distance to add.
+     * @param result Receives the batched distance when batching succeeds.
+     * @return True when the sum fits in a signed 16-bit value.
+     */
+    bool batch_horizontal_scroll(std::int16_t dest, std::int16_t src, std::int16_t &result);
+
+    /**
      * @brief Replace the global platform input backend for a unit test.
      *
      * @param input Test-owned platform input backend.

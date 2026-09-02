@@ -461,7 +461,8 @@ namespace platf::virtualhid {
 
   void input_context_t::refresh_keyboard() {
     keyboard.reset();
-    if (!runtime || !runtime->capabilities().supports_keyboard) {
+    const auto capability_available = runtime && runtime->capabilities().supports_keyboard;
+    if (!capability_available) {
       return;
     }
 

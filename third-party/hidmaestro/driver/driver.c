@@ -123,7 +123,7 @@ InitInstancePaths(
         AppendUlongDecimal(ctx->ConfigRegPath, index, cap);
     }
     {
-        static const WCHAR prefix[] = L"Global\\HIDMaestroInput";
+        static const WCHAR prefix[] = L"Global\\HIDMaestroInputQueue";
         SIZE_T cap = sizeof(ctx->SharedMappingName) / sizeof(WCHAR);
         RtlCopyMemory(ctx->SharedMappingName, prefix, sizeof(prefix));
         AppendUlongDecimal(ctx->SharedMappingName, index, cap);
@@ -141,10 +141,16 @@ InitInstancePaths(
         AppendUlongDecimal(ctx->PidStateMappingName, index, cap);
     }
     {
-        static const WCHAR prefix[] = L"Global\\HIDMaestroInputEvent";
+        static const WCHAR prefix[] = L"Global\\HIDMaestroInputQueueEvent";
         SIZE_T cap = sizeof(ctx->InputEventName) / sizeof(WCHAR);
         RtlCopyMemory(ctx->InputEventName, prefix, sizeof(prefix));
         AppendUlongDecimal(ctx->InputEventName, index, cap);
+    }
+    {
+        static const WCHAR prefix[] = L"Global\\HIDMaestroInputQueueSpaceEvent";
+        SIZE_T cap = sizeof(ctx->InputSpaceEventName) / sizeof(WCHAR);
+        RtlCopyMemory(ctx->InputSpaceEventName, prefix, sizeof(prefix));
+        AppendUlongDecimal(ctx->InputSpaceEventName, index, cap);
     }
     {
         static const WCHAR prefix[] = L"Global\\HIDMaestroOutputEvent";
@@ -390,15 +396,21 @@ ReadConfigFromRegistry(
 /*  Shared Memory Poll Timer                                           */
 /* ================================================================== */
 
-/* Try to open and map the named section. Returns TRUE on success.
- * On failure, leaves SharedMemHandle/SharedMemPtr unchanged (NULL). */
+/**
+ * @brief Open the named input section for report reads and Tail updates.
+ *
+ * @param ctx Device context that receives the section handles.
+ * @return TRUE when the section was opened and mapped.
+ *
+ * On failure, leaves SharedMemHandle/SharedMemPtr unchanged (NULL).
+ */
 static BOOLEAN
 TryOpenSharedMapping(_In_ PDEVICE_CONTEXT ctx)
 {
-    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, ctx->SharedMappingName);
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, ctx->SharedMappingName);
     if (h == NULL) return FALSE;
 
-    PVOID view = MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(HIDMAESTRO_SHARED_INPUT));
+    PVOID view = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(HIDMAESTRO_SHARED_INPUT));
     if (view == NULL) { CloseHandle(h); return FALSE; }
 
     ctx->SharedMemHandle = h;
@@ -703,34 +715,52 @@ PublishOutput(_In_ PDEVICE_CONTEXT ctx,
     if (ctx->OutputSignalEvent) SetEvent(ctx->OutputSignalEvent);
 }
 
-/* Read shared input via memory mapping. RAM-only — no disk fallback.
- * Output: *out is filled with the shared struct on success. */
+/**
+ * @brief Read one stable input queue slot without advancing the queue.
+ *
+ * @param ctx Device context that owns the mapped queue.
+ * @param out Destination for the stable slot snapshot.
+ * @param sequence Destination for the slot sequence number.
+ * @param latest Whether to read the latest published slot instead of the oldest unread slot.
+ * @return TRUE when a stable published slot was copied.
+ *
+ * The caller advances Tail only after the report has been handed to HIDClass.
+ */
 static BOOLEAN
-ReadSharedInput(_In_ PDEVICE_CONTEXT ctx, _Out_ HIDMAESTRO_SHARED_INPUT *out)
+ReadSharedInput(
+    _In_ PDEVICE_CONTEXT ctx,
+    _Out_ HIDMAESTRO_INPUT_SLOT *out,
+    _Out_ PULONG sequence,
+    _In_ BOOLEAN latest)
 {
     /* Lazy open: try the mapping on every tick until it succeeds.
      * The test app may create the section after the device starts. */
     if (ctx->SharedMemPtr == NULL && !TryOpenSharedMapping(ctx))
         return FALSE;
 
-    /* Seqlock-style read: retry until SeqNo is stable across the copy.
-     * Single writer / many readers, lock-free. */
+    /* Each slot is published by writing its sequence last. Tail is owned by
+     * this driver and Head is owned by the SDK, so unread slots are stable. */
     volatile HIDMAESTRO_SHARED_INPUT *src = (volatile HIDMAESTRO_SHARED_INPUT *)ctx->SharedMemPtr;
+    ULONG head = src->Head;
+    ULONG tail = src->Tail;
+    if (!latest && head == tail)
+        return FALSE;
+
+    ULONG expected = latest ? head : tail + 1;
+    volatile HIDMAESTRO_INPUT_SLOT *slot = &src->Slots[(expected - 1) % HIDMAESTRO_INPUT_RING_SLOTS];
     ULONG seq1, seq2;
     int retries = 4;
     do {
-        seq1 = src->SeqNo;
+        seq1 = slot->SeqNo;
         MemoryBarrier();
-        RtlCopyMemory(out, (const void *)src, sizeof(*out));
+        RtlCopyMemory(out, (const void *)slot, sizeof(*out));
         MemoryBarrier();
-        seq2 = src->SeqNo;
-    } while ((seq1 != seq2 || (seq1 & 1)) && --retries > 0);
-    /* Perf audit 2026-07-21 (I6): an odd SeqNo is a write in progress and
-     * an unequal pair is a torn copy; serving either hands a half-written
-     * frame downstream. Skip the frame instead: the SDK's per-frame
-     * SetEvent redelivers within one frame interval. */
-    if (seq1 != seq2 || (seq1 & 1))
+        seq2 = slot->SeqNo;
+    } while ((seq1 != seq2 || seq1 != expected) && --retries > 0);
+    if (seq1 != seq2 || seq1 != expected)
         return FALSE;
+
+    *sequence = expected;
     return TRUE;
 }
 
@@ -830,7 +860,8 @@ static UCHAR SwitchSpiByte(_In_ ULONG a)
  * at 0x800 (packed 00 08 80). */
 static VOID SwitchFillLatestState(_In_ PDEVICE_CONTEXT ctx, _Out_writes_(46) UCHAR *dst)
 {
-    HIDMAESTRO_SHARED_INPUT shared;
+    HIDMAESTRO_INPUT_SLOT shared;
+    ULONG sequence;
     RtlZeroMemory(dst, 46);
     dst[3] = 0x00; dst[4] = 0x08; dst[5] = 0x80;   /* left stick neutral  */
     dst[6] = 0x00; dst[7] = 0x08; dst[8] = 0x80;   /* right stick neutral */
@@ -842,7 +873,7 @@ static VOID SwitchFillLatestState(_In_ PDEVICE_CONTEXT ctx, _Out_writes_(46) UCH
      * frames are the correct output anyway. */
     if (ctx->SharedMemPtr == NULL) return;
 
-    if (ReadSharedInput(ctx, &shared) && shared.DataSize >= 11) {
+    if (ReadSharedInput(ctx, &shared, &sequence, TRUE) && shared.DataSize >= 11) {
         RtlCopyMemory(dst, shared.Data + 2, 9);    /* buttons + sticks */
         if (ctx->SwitchImuEnabled && shared.DataSize >= 48) {
             RtlCopyMemory(dst + 10, shared.Data + 12, 36); /* IMU x3 */
@@ -1248,26 +1279,36 @@ static DWORD WINAPI SwitchStreamProc(_In_ LPVOID Parameter)
     }
 }
 
-/* Core per-frame work extracted from the old EvtSharedMemTimer.
+/**
+ * @brief Process one queued input report for the HID class driver.
+ *
+ * @param ctx Device context that owns the input queue and pending reads.
+ *
+ * Core per-frame work extracted from the old EvtSharedMemTimer.
  * Called from the event-driven worker thread whenever the SDK signals
- * InputDataEvent (or the 50 ms safety tick fires). Doing all the HID
+ * InputDataEvent (or the 500 ms safety tick fires). Doing all the HID
  * report-build + manual-queue drain here — no WDF timer, no IRQL games:
  * WdfRequestComplete / WdfWaitLock* are documented safe from a raw worker
- * thread in UMDF2. */
+ * thread in UMDF2.
+ */
 static void
 ProcessSharedInput(_In_ PDEVICE_CONTEXT ctx)
 {
-    HIDMAESTRO_SHARED_INPUT shared;
-    if (!ReadSharedInput(ctx, &shared)) return;
+    WDFREQUEST pendingRead = NULL;
+    BOOLEAN havePendingRead = FALSE;
+    if (!ctx->SwitchProtocol) {
+        havePendingRead = NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->ManualQueue, &pendingRead));
+    }
 
-    ULONG seqNo = shared.SeqNo;
-    if (seqNo == ctx->SharedMemSeqNo) return; /* No new data */
-    /* NOTE: SharedMemSeqNo is advanced LATER, under InputLock, together
-     * with the InputReport cache write (see the completion block below).
-     * Publishing it here would let a concurrent IOCTL_HID_READ_REPORT
-     * observe the advanced seqno and complete with the PREVIOUS frame's
-     * cached report tagged as the new one (stale-frame TOCTOU). The
-     * local `seqNo` drives the rest of this call. */
+    HIDMAESTRO_INPUT_SLOT shared;
+    ULONG seqNo;
+    if (!ReadSharedInput(ctx, &shared, &seqNo, ctx->SwitchProtocol || !havePendingRead)) {
+        if (havePendingRead) {
+            NTSTATUS status = WdfRequestForwardToIoQueue(pendingRead, ctx->ManualQueue);
+            if (!NT_SUCCESS(status)) WdfRequestComplete(pendingRead, status);
+        }
+        return;
+    }
 
     /* Switch Pro mode: the protocol stream owns pacing and completion.
      * SwitchStreamProc serves 0x30 frames at the wire's 15 ms cadence
@@ -1278,7 +1319,14 @@ ProcessSharedInput(_In_ PDEVICE_CONTEXT ctx)
      * path has no InputReport-cache TOCTOU: its reader is the stream
      * thread reading the view directly, never SharedMemSeqNo), so the
      * worker's stale-wakeup counter still resets on new frames. */
-    if (ctx->SwitchProtocol) { ctx->SharedMemSeqNo = seqNo; return; }
+    if (ctx->SwitchProtocol) {
+        volatile HIDMAESTRO_SHARED_INPUT *queue =
+            (volatile HIDMAESTRO_SHARED_INPUT *)ctx->SharedMemPtr;
+        queue->Tail = seqNo;
+        ctx->SharedMemSeqNo = seqNo;
+        if (ctx->InputSpaceEvent) SetEvent(ctx->InputSpaceEvent);
+        return;
+    }
 
     /* Build HID input report from shared file Data (native descriptor format).
      * Report MUST be exactly InputReportByteLength bytes — HidClass rejects
@@ -1353,6 +1401,18 @@ ProcessSharedInput(_In_ PDEVICE_CONTEXT ctx)
         col2Size = 5; /* Report ID + Brake(2) + Accel(2) */
     }
 
+    /* Refresh the cache used by polled GET_INPUT_REPORT without consuming
+     * the queue. A streaming READ_REPORT below advances Tail only after its
+     * oldest report has been completed. */
+    WdfWaitLockAcquire(ctx->InputLock, NULL);
+    RtlCopyMemory(ctx->InputReport, inputReport, inputSize);
+    ctx->InputReportSize = inputSize;
+    ctx->InputReportReady = TRUE;
+    WdfWaitLockRelease(ctx->InputLock);
+
+    if (!havePendingRead)
+        return;
+
     /* Complete exactly ONE pending READ_REPORT per shared-memory state
      * change — not ALL queued requests. HidClass pre-queues READ_REPORTs
      * for performance; draining the entire queue with the same cached
@@ -1361,85 +1421,91 @@ ProcessSharedInput(_In_ PDEVICE_CONTEXT ctx)
      * as a separate WM_INPUT. Consumers that handle RawInput per-message
      * (Start Menu / Xbox accessories UI) then register N navigation
      * events per single press — the triple/double-movement bug in
-     * issue #8, empirically verified via InputSourceCounter probe
-     * (5 WM_INPUTs from one hDevice per single press, state change
-     * visible only once at XInput/RGC/UINav).
+     * issue #8. Burst-input testing observed five WM_INPUT messages from
+     * one hDevice per single press, while XInput, RGC, and UINav observed
+     * the state change only once.
      *
      * One report per state change matches what real hardware does:
      * a physical Xbox controller produces exactly one HID report per
      * actual input change, not N reports to satisfy N queued reads.
-     * Subsequent queued READ_REPORTs stay parked until the SDK
-     * SubmitStates the next frame. */
+     * Subsequent READ_REPORTs consume distinct queued states. An existing
+     * backlog is drained at the paced one-millisecond cadence below. */
     {
-        BOOLEAN servedOne = FALSE;
-        WDFREQUEST pendingRead;
-        if (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->ManualQueue, &pendingRead))) {
-            servedOne = TRUE;
-            /* Send Col1 (GIP, no Report ID) */
-            NTSTATUS cs = RequestCopyFromBuffer(pendingRead, inputReport, inputSize);
-            WdfRequestComplete(pendingRead, NT_SUCCESS(cs) ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL);
+        /* Send Col1 (GIP, no Report ID). */
+        NTSTATUS cs = RequestCopyFromBuffer(pendingRead, inputReport, inputSize);
+        WdfRequestComplete(pendingRead, NT_SUCCESS(cs) ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL);
 
-            /* Send Col2 (Report ID 0x20) if available — one Col2 read
-             * paired with one Col1 read, still one logical "frame." */
-            if (col2Size > 0 &&
-                NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->ManualQueue, &pendingRead))) {
-                cs = RequestCopyFromBuffer(pendingRead, col2Report, col2Size);
-                WdfRequestComplete(pendingRead, NT_SUCCESS(cs) ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL);
-            }
+        /* Send Col2 (Report ID 0x20) if available — one Col2 read
+         * paired with one Col1 read, still one logical "frame." */
+        if (col2Size > 0 &&
+            NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->ManualQueue, &pendingRead))) {
+            cs = RequestCopyFromBuffer(pendingRead, col2Report, col2Size);
+            WdfRequestComplete(pendingRead, NT_SUCCESS(cs) ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL);
         }
-        /* Store for polled GET_INPUT_REPORT, and bump the seqno gate
-         * so the next IOCTL_HID_READ_REPORT for this seqno completes
-         * directly (the queued ones have already been drained above). */
-        WdfWaitLockAcquire(ctx->InputLock, NULL);
-        RtlCopyMemory(ctx->InputReport, inputReport, inputSize);
-        ctx->InputReportSize = inputSize;
-        ctx->InputReportReady = TRUE;
-        /* Publish the seqno LAST, under the same lock IOCTL_HID_READ_REPORT
-         * takes, so a concurrent read sees either the old seqno (and parks)
-         * or the new seqno paired with the freshly-written InputReport.
-         * Advancing it in ProcessSharedInput's preamble (before this cache
-         * write) was the stale-frame TOCTOU. */
         ctx->SharedMemSeqNo = seqNo;
-        /* Perf audit 2026-07-21 (I5): advance the delivered gate ONLY when
-         * a parked read was actually completed above. The unconditional
-         * advance contradicted this block's own header comment and
-         * disabled the late-read cache: a READ_REPORT arriving with no
-         * request parked saw SharedMemSeqNo == LastDelivered, parked, and
-         * waited a full frame interval for data already sitting in the
-         * cache. The spin-trap the gate exists for stays closed because
-         * the immediate-complete path advances LastDelivered itself. */
-        if (servedOne)
-            ctx->LastDeliveredInputSeqNo = seqNo;
-        WdfWaitLockRelease(ctx->InputLock);
+
+        {
+            volatile HIDMAESTRO_SHARED_INPUT *queue =
+                (volatile HIDMAESTRO_SHARED_INPUT *)ctx->SharedMemPtr;
+            MemoryBarrier();
+            queue->Tail = seqNo;
+            if (ctx->InputSpaceEvent) SetEvent(ctx->InputSpaceEvent);
+        }
     }
 }
 
-/* Event-driven worker thread. Bulletproof design: the ONLY way this
+/**
+ * @brief Pace queued backlog reports at a one-millisecond cadence.
+ *
+ * @param ctx Device context that owns the queue and pacing timer.
+ *
+ * The first report is completed immediately;
+ * subsequent queued reports follow a 1 kHz hardware-like cadence so the
+ * Windows mouse stack does not collapse an entire burst into one update.
+ */
+static VOID
+PaceSharedInputBacklog(_In_ PDEVICE_CONTEXT ctx)
+{
+    if (ctx->SwitchProtocol || ctx->SharedMemPtr == NULL)
+        return;
+
+    volatile HIDMAESTRO_SHARED_INPUT *queue =
+        (volatile HIDMAESTRO_SHARED_INPUT *)ctx->SharedMemPtr;
+    if (queue->Head == queue->Tail)
+        return;
+
+    LARGE_INTEGER due;
+    due.QuadPart = -10000; /* 1 ms in 100 ns units. */
+    if (ctx->InputPacingTimer != NULL &&
+        SetWaitableTimer(ctx->InputPacingTimer, &due, 0, NULL, NULL, FALSE) &&
+        WaitForSingleObject(ctx->InputPacingTimer, 2) != WAIT_FAILED)
+        return;
+
+    Sleep(1);
+}
+
+/**
+ * @brief Drain shared input in response to producer and HID-read events.
+ *
+ * @param Parameter Pointer to the device context.
+ * @return Zero when device teardown stops the worker.
+ *
+ * Bulletproof design: the ONLY way this
  * function returns is StopEvent signaled WITH ctx->TearingDown set
  * (issue #38). Every other condition, including a foreign signal on the
- * shared named StopEvent, plus WAIT_FAILED, WAIT_TIMEOUT, stale-handle
- * detection, invalid-handle, OpenEvent/OpenFileMapping failure,
- * recycles the handles and loops back to Phase 1 to re-discover fresh
- * kernel objects.
- *
- * This is a deliberate departure from the prior "5s timeout OR 250 stale
- * wakeups" logic, which could leave the worker stuck in scenarios where
- * the SDK kept signaling the old event (keeping staleWakeups small) but
- * the shared-memory view was pointing at destroyed/stale pages. In that
- * state the 5s timeout never fired (events kept arriving) and the stale
- * counter reset on each signal, so recycle never triggered — permanent
- * deadlock until WUDFHost was killed.
+ * shared named StopEvent. Failed waits and invalid named handles recycle
+ * through Phase 1. Data, HID-read, and timeout wakes drain available queue
+ * entries; more than 250 wakes without sequence progress also trigger
+ * handle and mapping recovery.
  *
  * Two-phase wait:
  *   Phase 1 (bootstrap): the driver may attach before the SDK has created
- *     Global\HIDMaestroInputEvent<N>. Wait on StopEvent only with a short
+ *     Global\HIDMaestroInputQueueEvent<N>. Wait on StopEvent only with a short
  *     200 ms timeout; on each timeout, retry OpenEventW. Once it succeeds,
  *     drop into Phase 2.
- *   Phase 2 (steady state): wait on (StopEvent, InputDataEvent) with a
- *     500 ms timeout so even if the SDK never signals, we recycle and
- *     re-verify handles every half second. When the SDK is active this
- *     is still effectively zero CPU (events arrive well under 500 ms) —
- *     the timeout is a safety net, not a polling interval.
+ *   Phase 2 (steady state): wait on StopEvent, InputDataEvent, and the
+ *     stable ReadRequestEvent. A 500 ms timeout checks the queue when a
+ *     producer signal is lost and contributes to stale-handle detection.
  *
  * StopEvent is signaled from:
  *   (a) EvtDeviceContextCleanup: normal PnP teardown. Sets
@@ -1461,7 +1527,8 @@ ProcessSharedInput(_In_ PDEVICE_CONTEXT ctx)
  * WdfRequestComplete during a concurrent teardown), and also bounds the
  * benign race where a foreign absorb's ResetEvent eats our own
  * teardown's signal a beat before the flag re-check would have caught
- * it. */
+ * it.
+ */
 static DWORD WINAPI
 SharedInputWorkerProc(_In_ LPVOID Parameter)
 {
@@ -1476,13 +1543,17 @@ SharedInputWorkerProc(_In_ LPVOID Parameter)
         /* Phase 1: bootstrap — wait for the SDK to create the named event.
          * StopEvent is checked on every 200 ms tick so teardown stays
          * responsive even when the SDK hasn't started up yet. */
-        while (ctx->InputDataEvent == NULL) {
-            HANDLE ev = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE,
-                                   ctx->InputEventName);
-            if (ev != NULL) {
-                ctx->InputDataEvent = ev;
-                break;
+        while (ctx->InputDataEvent == NULL || ctx->InputSpaceEvent == NULL) {
+            if (ctx->InputDataEvent == NULL) {
+                ctx->InputDataEvent = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE,
+                                                 ctx->InputEventName);
             }
+            if (ctx->InputSpaceEvent == NULL) {
+                ctx->InputSpaceEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE,
+                                                  ctx->InputSpaceEventName);
+            }
+            if (ctx->InputDataEvent != NULL && ctx->InputSpaceEvent != NULL)
+                break;
             {
                 DWORD rc1 = WaitForSingleObject(ctx->StopEvent, 200);
                 /* Issue #38: the FLAG is the authoritative exit
@@ -1507,21 +1578,28 @@ SharedInputWorkerProc(_In_ LPVOID Parameter)
             }
         }
 
-        /* Phase 2: steady state. The 500 ms timeout + unconditional recycle
-         * on ANY non-signal rc (TIMEOUT, FAILED, ABANDONED, unexpected)
-         * guarantees recovery from every class of stale-handle failure
-         * within half a second of the SDK stopping signaling. The stale-
-         * seqno counter recycles after 250 wakeups (~5s at ~50 Hz input)
-         * to catch the "event fires but shared-memory view is stale" case,
-         * where the SDK keeps signaling an event object we share by name
-         * but writes to a view the driver isn't reading from anymore. */
+        /* A READ_REPORT can arrive while named handles are being opened.
+         * Drain once before waiting so that wake cannot be stranded. */
+        {
+            ULONG previous;
+            do {
+                previous = ctx->SharedMemSeqNo;
+                ProcessSharedInput(ctx);
+                if (ctx->SharedMemSeqNo != previous)
+                    PaceSharedInputBacklog(ctx);
+            } while (ctx->SharedMemSeqNo != previous);
+        }
+
+        /* Phase 2: steady state. Data, read-request, and timeout wakes drain
+         * the queue. The stale-sequence counter recycles after more than 250
+         * wake or timeout cycles without progress, while failed, abandoned,
+         * and unexpected waits recycle immediately. */
         ULONG staleWakeups = 0;
-        ULONG idleTimeouts = 0;
         BOOLEAN recycle = FALSE;
-        HANDLE waits[2] = { ctx->StopEvent, ctx->InputDataEvent };
+        HANDLE waits[3] = { ctx->StopEvent, ctx->InputDataEvent, ctx->ReadRequestEvent };
 
         for (;;) {
-            DWORD rc = WaitForMultipleObjects(2, waits, FALSE, 500);
+            DWORD rc = WaitForMultipleObjects(3, waits, FALSE, 500);
 
             /* Issue #38: TearingDown is the authoritative exit
              * condition, checked on EVERY wake including timeouts. The
@@ -1557,11 +1635,16 @@ SharedInputWorkerProc(_In_ LPVOID Parameter)
                 break;
             }
 
-            if (rc == WAIT_OBJECT_0 + 1) {
-                idleTimeouts = 0;
-                ULONG prevSeq = ctx->SharedMemSeqNo;
-                ProcessSharedInput(ctx);
-                if (ctx->SharedMemSeqNo == prevSeq) {
+            if (rc == WAIT_OBJECT_0 + 1 || rc == WAIT_OBJECT_0 + 2 || rc == WAIT_TIMEOUT) {
+                ULONG initialSeq = ctx->SharedMemSeqNo;
+                ULONG prevSeq;
+                do {
+                    prevSeq = ctx->SharedMemSeqNo;
+                    ProcessSharedInput(ctx);
+                    if (ctx->SharedMemSeqNo != prevSeq)
+                        PaceSharedInputBacklog(ctx);
+                } while (ctx->SharedMemSeqNo != prevSeq);
+                if (ctx->SharedMemSeqNo == initialSeq) {
                     if (++staleWakeups > 250) { recycle = TRUE; break; }
                 } else {
                     staleWakeups = 0;
@@ -1569,23 +1652,9 @@ SharedInputWorkerProc(_In_ LPVOID Parameter)
                 continue;
             }
 
-            /* Perf audit 2026-07-21 (I2): a single 500 ms timeout is the
-             * NORMAL idle state (consumer between frames, game menus),
-             * and recycling handles on every one cost an unmap/reopen
-             * cycle twice a second plus a mapping tax on the first frame
-             * after every pause. Recycle only after 8 consecutive idle
-             * timeouts (~4 s): stale-handle recovery after an SDK restart
-             * still converges within 4 s, and the signaled-but-stale case
-             * keeps its own 250-wakeup counter above. */
-            if (rc == WAIT_TIMEOUT && ++idleTimeouts < 8)
-                continue;
-
-            /* WAIT_TIMEOUT streak exhausted, WAIT_FAILED (0xFFFFFFFF), or
-             * any other unexpected value. Previously WAIT_FAILED returned
-             * 0 and killed the worker permanently; now we recycle like
-             * every other non-signal path and let Phase 1 re-open fresh
-             * handles. The 2-second thread-join timeout in
-             * EvtDeviceContextCleanup still bounds any teardown race. */
+            /* A failed named handle is reopened through Phase 1. The local
+             * ReadRequestEvent remains stable, and Phase 1 drains after the
+             * reopen, so a parked read cannot lose its wake. */
             recycle = TRUE;
             break;
         }
@@ -1596,6 +1665,8 @@ SharedInputWorkerProc(_In_ LPVOID Parameter)
              * sequence symmetric with TryOpenSharedMapping. */
             CloseHandle(ctx->InputDataEvent);
             ctx->InputDataEvent = NULL;
+            CloseHandle(ctx->InputSpaceEvent);
+            ctx->InputSpaceEvent = NULL;
 
             /* Switch Pro: the SEPARATE SwitchStreamProc thread reads
              * SharedMemPtr via SwitchFillLatestState at 15 ms cadence,
@@ -1652,6 +1723,9 @@ static void EvtDeviceContextCleanup(_In_ WDFOBJECT Object)
     }
     if (ctx->SwitchStreamStop) { CloseHandle(ctx->SwitchStreamStop); ctx->SwitchStreamStop = NULL; }
     if (ctx->InputDataEvent) { CloseHandle(ctx->InputDataEvent); ctx->InputDataEvent = NULL; }
+    if (ctx->InputSpaceEvent) { CloseHandle(ctx->InputSpaceEvent); ctx->InputSpaceEvent = NULL; }
+    if (ctx->ReadRequestEvent) { CloseHandle(ctx->ReadRequestEvent); ctx->ReadRequestEvent = NULL; }
+    if (ctx->InputPacingTimer) { CloseHandle(ctx->InputPacingTimer); ctx->InputPacingTimer = NULL; }
     if (ctx->StopEvent)      { CloseHandle(ctx->StopEvent);      ctx->StopEvent = NULL; }
     if (ctx->OutputSignalEvent) { CloseHandle(ctx->OutputSignalEvent); ctx->OutputSignalEvent = NULL; }
 
@@ -1859,14 +1933,20 @@ EvtDeviceAdd(
     ctx->SharedMemHandle = NULL;
     ctx->SharedMemPtr = NULL;
     ctx->SharedMemSeqNo = 0;
-
     /* Event-driven shared-input worker. The SDK creates
-     * Global\HIDMaestroInputEvent<N> alongside the section and SetEvents
+     * Global\HIDMaestroInputQueueEvent<N> alongside the section and SetEvents
      * it per frame; we OpenEvent lazily in the worker (it may not exist
      * yet at EvtDeviceAdd time). StopEvent is our sentinel for shutdown.
      * Replaces the old 1 ms WdfTimer busy poll — see commit/diff for the
      * CPU-saturation root cause. */
     ctx->InputDataEvent = NULL;
+    ctx->InputSpaceEvent = NULL;
+    ctx->ReadRequestEvent = CreateEventW(NULL, FALSE /* auto reset */, FALSE, NULL);
+    if (ctx->ReadRequestEvent == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    ctx->InputPacingTimer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
+    if (ctx->InputPacingTimer == NULL)
+        ctx->InputPacingTimer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    if (ctx->InputPacingTimer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
     /* Create a NAMED StopEvent so external cleanup code (SDK's
      * RemoveAllVirtualControllers) can signal it after a force-kill,
      * breaking the deadlock where PnP waits for WUDFHost to release
@@ -2020,19 +2100,9 @@ EvtIoDeviceControl(
     }
 
     case IOCTL_HID_READ_REPORT: {
-        /*
-         * HID class wants an input report.
-         *
-         * Critical: only complete IMMEDIATELY when the cached report is
-         * NEWER than the last one we delivered. Otherwise pend in ManualQueue
-         * and let ProcessSharedInput drain it when the SDK next signals.
-         *
-         * Without this seqno gate, every READ_REPORT completes instantly
-         * with stale cached data, HIDClass immediately re-issues, and we
-         * burn a core per device hammering the kernel↔user mode bridge.
-         * GET_INPUT_REPORT (a different IOCTL, polled diagnostic path) is
-         * unaffected — it still reads the cache directly.
-         */
+        /* HID class wants an input report. Park every request so the worker
+         * can pair it with exactly one ordered input queue entry. Completing
+         * from the latest cache would either duplicate or skip reports. */
         /* Switch Pro mode: pending 0x81/0x21 replies preempt; otherwise
          * every read parks and the 60 Hz stream thread completes it on
          * its next tick, giving the wire the real controller's cadence
@@ -2049,19 +2119,10 @@ EvtIoDeviceControl(
             break;
         }
 
-        WdfWaitLockAcquire(ctx->InputLock, NULL);
-
-        if (ctx->InputReportReady && ctx->SharedMemSeqNo > ctx->LastDeliveredInputSeqNo) {
-            status = RequestCopyFromBuffer(Request,
-                ctx->InputReport, ctx->InputReportSize);
-            ctx->LastDeliveredInputSeqNo = ctx->SharedMemSeqNo;
-            WdfWaitLockRelease(ctx->InputLock);
-        } else {
-            WdfWaitLockRelease(ctx->InputLock);
-            status = WdfRequestForwardToIoQueue(Request, ctx->ManualQueue);
-            if (NT_SUCCESS(status)) {
-                completeRequest = FALSE;
-            }
+        status = WdfRequestForwardToIoQueue(Request, ctx->ManualQueue);
+        if (NT_SUCCESS(status)) {
+            completeRequest = FALSE;
+            SetEvent(ctx->ReadRequestEvent);
         }
         break;
     }

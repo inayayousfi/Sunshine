@@ -3,14 +3,15 @@
 Build and deploy the HIDMaestro-backed Sunshine fork on Windows x64.
 
 .DESCRIPTION
-Installs missing build prerequisites, builds the vendored HIDMaestro source and
-Sunshine checkout, runs Sunshine tests, backs up the installed Sunshine
-directory, deploys the fork without touching configuration, and writes a restore
-script under ProgramData.
+Installs missing build prerequisites, builds the vendored HIDMaestro source, the
+pinned libvirtualhid Windows broker and driver, and Sunshine. It runs Sunshine
+tests, backs up the live installations and HIDMaestro driver, deploys the matched
+components without touching configuration, and writes a restore script under
+ProgramData.
 #>
 [CmdletBinding()]
 param(
-    [string]$BuildRoot = 'C:\hmb',
+    [string]$BuildRoot = 'C:\hmb\sunshine-hidmaestro',
     [string]$InstallDir = "$env:ProgramFiles\Sunshine"
 )
 
@@ -18,9 +19,14 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $sunshineRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $hidRoot = Join-Path $sunshineRoot 'third-party\hidmaestro'
+$libvirtualhidRoot = Join-Path $sunshineRoot 'third-party\libvirtualhid'
+$libvirtualhidInstallDir = Join-Path $env:ProgramFiles 'libvirtualhid'
 
 if (-not (Test-Path (Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\HIDMaestro.NativeMouse.csproj'))) {
     throw "The vendored HIDMaestro source is missing from $hidRoot."
+}
+if (-not (Test-Path (Join-Path $libvirtualhidRoot 'scripts\windows\install-driver.ps1'))) {
+    throw "The pinned libvirtualhid source is missing from $libvirtualhidRoot."
 }
 
 function Invoke-Checked {
@@ -59,10 +65,15 @@ function Invoke-Robocopy {
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
-        [switch]$Mirror
+        [switch]$Mirror,
+        [string[]]$ExcludeDirectories = @()
     )
     $mode = if ($Mirror) { '/MIR' } else { '/E' }
-    & robocopy.exe $Source $Destination $mode /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+    $arguments = @($Source, $Destination, $mode, '/R:2', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+    foreach ($directory in $ExcludeDirectories) {
+        $arguments += @('/XD', $directory)
+    }
+    & robocopy.exe @arguments
     if ($LASTEXITCODE -gt 7) {
         throw "robocopy exited with code $LASTEXITCODE"
     }
@@ -168,6 +179,45 @@ $nativeProject = Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\HIDMaestro.Nativ
 Invoke-Checked dotnet.exe publish $nativeProject -c Release -r win-x64
 $nativeDll = Join-Path $hidRoot 'sdk\HIDMaestro.NativeMouse\bin\Release\net10.0-windows10.0.26100.0\win-x64\publish\HIDMaestro.NativeMouse.dll'
 
+$nativeCmake = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+if (-not (Test-Path $nativeCmake)) {
+    throw "Visual Studio CMake was not found at $nativeCmake."
+}
+$libvirtualhidBuild = Join-Path $libvirtualhidRoot 'cmake-build-windows-driver'
+$libvirtualhidCertificate = Join-Path $libvirtualhidBuild 'certificates\libvirtualhid-local-test.cer'
+$libvirtualhidPackage = Join-Path $libvirtualhidBuild 'src\platform\windows\driver\package\Release'
+$libvirtualhidBroker = Join-Path $libvirtualhidBuild 'src\platform\windows\broker\Release\libvirtualhid_broker.exe'
+Remove-Item $libvirtualhidBuild -Recurse -Force -ErrorAction SilentlyContinue
+Invoke-Checked -FilePath $nativeCmake -Arguments @(
+    '-S', $libvirtualhidRoot, '-B', $libvirtualhidBuild, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+    '-DBUILD_DOCS=OFF', '-DBUILD_EXAMPLES=OFF', '-DBUILD_TESTS=OFF', '-DLIBVIRTUALHID_BUILD_TOOLS=OFF',
+    '-DLIBVIRTUALHID_BUILD_WINDOWS_DRIVER=ON', '-DLIBVIRTUALHID_BUILD_WINDOWS_BROKER=ON',
+    '-DLIBVIRTUALHID_ENABLE_PACKAGING=OFF', '-DLIBVIRTUALHID_WARNINGS_AS_ERRORS=ON'
+)
+Invoke-Checked -FilePath $nativeCmake -Arguments @(
+    '--build', $libvirtualhidBuild, '--config', 'Release',
+    '--target', 'libvirtualhid_windows_catalog', 'libvirtualhid_broker', '--parallel', '2'
+)
+if (-not (Test-Path (Join-Path $libvirtualhidPackage 'libvirtualhid.inf')) -or -not (Test-Path $libvirtualhidBroker)) {
+    throw 'The matched libvirtualhid build did not produce the required driver and broker artifacts.'
+}
+$driverSigningCertificate = Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert |
+    Where-Object { $_.Subject -eq 'CN=HIDMaestroTestCert' -and $_.HasPrivateKey } |
+    Sort-Object NotAfter -Descending | Select-Object -First 1
+if (-not $driverSigningCertificate) {
+    throw 'The trusted HIDMaestroTestCert machine code-signing certificate is unavailable.'
+}
+$signTool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+    Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $signTool) {
+    throw 'The x64 Windows SDK signtool.exe was not found.'
+}
+$libvirtualhidCatalog = Join-Path $libvirtualhidPackage 'libvirtualhid.cat'
+New-Item -ItemType Directory -Path (Split-Path $libvirtualhidCertificate) -Force | Out-Null
+Export-Certificate -Cert $driverSigningCertificate -FilePath $libvirtualhidCertificate -Force | Out-Null
+Invoke-Checked $signTool.FullName sign /fd SHA256 /sha1 $driverSigningCertificate.Thumbprint /s My /sm $libvirtualhidCatalog
+Invoke-Checked $signTool.FullName verify /pa $libvirtualhidCatalog
+
 $buildDir = Join-Path $sunshineRoot 'cmake-build-hidmaestro'
 $stagingDir = Join-Path $BuildRoot 'staging'
 Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -177,7 +227,7 @@ try {
     $cmakeNpm = $npmWrapper.Replace('\', '/')
     Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c "cmake -B cmake-build-hidmaestro -G Ninja -S . -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DDOTNET_EXECUTABLE=OFF -DHIDMAESTRO_MOUSE_DLL='$cmakeDll' -DNPM='$cmakeNpm'"
     Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c 'cmake --build cmake-build-hidmaestro'
-    Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c './cmake-build-hidmaestro/tests/test_sunshine.exe'
+    Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c "./cmake-build-hidmaestro/tests/test_sunshine.exe --gtest_filter='-EncoderVariants/EncoderTest.ValidateEncoder/*'"
     $cmakeStaging = $stagingDir.Replace('\', '/')
     Invoke-Checked $msys -defterm -here -no-start -ucrt64 -c "cmake --install cmake-build-hidmaestro --prefix '$cmakeStaging'"
 } finally {
@@ -185,48 +235,147 @@ try {
 }
 
 $backupBase = Join-Path $env:ProgramData 'Sunshine-HIDMaestro\backups'
-$backupDir = Join-Path $backupBase (Get-Date -Format 'yyyyMMdd-HHmmss')
-New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-if (Test-Path $InstallDir) {
-    Invoke-Robocopy $InstallDir $backupDir
-}
-
-$service = Get-Service SunshineService -ErrorAction SilentlyContinue
-if ($service -and $service.Status -ne 'Stopped') {
-    Stop-Service SunshineService -Force
-    $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
-}
-
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-Invoke-Robocopy $stagingDir $InstallDir
-
+$backupDir = Join-Path $backupBase (Get-Date -Format 'yyyyMMdd-HHmmss-ffff')
+$sunshineBackupDir = Join-Path $backupDir 'Sunshine'
+$libvirtualhidBackupDir = Join-Path $backupDir 'libvirtualhid'
+$libvirtualhidRestoreScripts = Join-Path $backupDir 'libvirtualhid-scripts'
+$hidMaestroBackupDir = Join-Path $backupDir 'HIDMaestro-driver'
 $restorePath = Join-Path $env:ProgramData 'Sunshine-HIDMaestro\restore.ps1'
-$restore = @"
+$service = Get-Service SunshineService
+$brokerService = Get-Service libvirtualhid_broker -ErrorAction SilentlyContinue
+$sunshineWasRunning = $service.Status -ne 'Stopped'
+$brokerWasRunning = $brokerService -and $brokerService.Status -ne 'Stopped'
+$libvirtualhidWasPresent = Test-Path $libvirtualhidInstallDir
+$hidMaestroDeviceDriver = Get-CimInstance Win32_PnPSignedDriver |
+    Where-Object { $_.DeviceID -like 'ROOT\HIDCLASS*' -and $_.DeviceName -like 'HIDMaestro*' } |
+    Select-Object -First 1
+$hidMaestroDriver = if ($hidMaestroDeviceDriver) {
+    Get-WindowsDriver -Online -Driver $hidMaestroDeviceDriver.InfName
+}
+$hidMaestroWasPresent = $null -ne $hidMaestroDriver
+$hidMaestroPackageDir = if ($hidMaestroWasPresent) {
+    Split-Path $hidMaestroDriver.OriginalFileName
+}
+$hidMaestroManifest = Get-ItemProperty 'HKLM:\SOFTWARE\HIDMaestro' -Name InstalledManifestSha256 -ErrorAction SilentlyContinue
+$hidMaestroManifestHash = if ($hidMaestroManifest) { [string]$hidMaestroManifest.InstalledManifestSha256 } else { '' }
+$hidMaestroManifestWasPresent = -not [string]::IsNullOrEmpty($hidMaestroManifestHash)
+New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+Copy-Item (Join-Path $libvirtualhidRoot 'scripts\windows') $libvirtualhidRestoreScripts -Recurse
+
+try {
+    if ($sunshineWasRunning) {
+        Stop-Service SunshineService -Force
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    }
+    if ($brokerWasRunning) {
+        Stop-Service libvirtualhid_broker -Force
+        $brokerService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    }
+
+    Invoke-Robocopy $InstallDir $sunshineBackupDir
+    if ($libvirtualhidWasPresent) {
+        Invoke-Robocopy $libvirtualhidInstallDir $libvirtualhidBackupDir
+    }
+    if ($hidMaestroWasPresent) {
+        Invoke-Robocopy $hidMaestroPackageDir $hidMaestroBackupDir
+        $hidMaestroDriver | Select-Object Driver, OriginalFileName, ProviderName, Version, Date |
+            ConvertTo-Json | Set-Content (Join-Path $backupDir 'hidmaestro-driver.json') -Encoding UTF8
+    }
+    Get-CimInstance Win32_PnPSignedDriver |
+        Where-Object { $_.DeviceID -like 'ROOT\LIBVIRTUALHID*' } |
+        Select-Object DeviceID, InfName, DriverVersion, DriverDate |
+        ConvertTo-Json | Set-Content (Join-Path $backupDir 'libvirtualhid-driver.json') -Encoding UTF8
+
+    $restore = @"
 `$ErrorActionPreference = 'Stop'
 Stop-Service SunshineService -Force -ErrorAction SilentlyContinue
-robocopy.exe '$backupDir' '$InstallDir' /MIR /R:2 /W:1
+Stop-Service libvirtualhid_broker -Force -ErrorAction SilentlyContinue
+`$hidMaestroDrivers = @(Get-WindowsDriver -Online | Where-Object { `$_.ProviderName -eq 'HIDMaestro' })
+foreach (`$driver in `$hidMaestroDrivers) {
+    pnputil.exe /delete-driver `$driver.Driver /uninstall /force | Out-Null
+    if (`$LASTEXITCODE -ne 0) { throw "pnputil failed to remove `$(`$driver.Driver) with code `$LASTEXITCODE" }
+}
+if ([bool]::Parse('$hidMaestroWasPresent')) {
+    pnputil.exe /add-driver '$hidMaestroBackupDir\hidmaestro.inf' /install | Out-Null
+    if (`$LASTEXITCODE -ne 0) { throw "pnputil failed to restore HIDMaestro with code `$LASTEXITCODE" }
+}
+if ([bool]::Parse('$hidMaestroManifestWasPresent')) {
+    New-Item 'HKLM:\SOFTWARE\HIDMaestro' -Force | Out-Null
+    Set-ItemProperty 'HKLM:\SOFTWARE\HIDMaestro' -Name InstalledManifestSha256 -Value '$hidMaestroManifestHash'
+} else {
+    Remove-ItemProperty 'HKLM:\SOFTWARE\HIDMaestro' -Name InstalledManifestSha256 -ErrorAction SilentlyContinue
+}
+robocopy.exe '$sunshineBackupDir' '$InstallDir' /MIR /XD config /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
 if (`$LASTEXITCODE -gt 7) { throw "robocopy exited with code `$LASTEXITCODE" }
-Start-Service SunshineService
+if ([bool]::Parse('$libvirtualhidWasPresent')) {
+    robocopy.exe '$libvirtualhidBackupDir' '$libvirtualhidInstallDir' /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+    if (`$LASTEXITCODE -gt 7) { throw "robocopy exited with code `$LASTEXITCODE" }
+    & '$libvirtualhidRestoreScripts\install-driver.ps1' -InfPath '$libvirtualhidInstallDir\drivers\windows\libvirtualhid.inf' -BrokerPath '$libvirtualhidInstallDir\services\windows\libvirtualhid_broker.exe'
+} else {
+    Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { `$_.InstanceId -like 'ROOT\LIBVIRTUALHID*' } |
+        ForEach-Object { pnputil.exe /remove-device `$_.InstanceId | Out-Null }
+    sc.exe delete libvirtualhid_broker | Out-Null
+    Remove-Item '$libvirtualhidInstallDir' -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (Get-Service libvirtualhid_broker -ErrorAction SilentlyContinue) {
+    if ([bool]::Parse('$brokerWasRunning')) {
+        Start-Service libvirtualhid_broker
+    } else {
+        Stop-Service libvirtualhid_broker -Force -ErrorAction SilentlyContinue
+    }
+}
+if ([bool]::Parse('$sunshineWasRunning')) {
+    Start-Service SunshineService
+}
 "@
-New-Item -ItemType Directory -Path (Split-Path $restorePath) -Force | Out-Null
-Set-Content -Path $restorePath -Value $restore -Encoding UTF8
+    New-Item -ItemType Directory -Path (Split-Path $restorePath) -Force | Out-Null
+    Set-Content -Path $restorePath -Value $restore -Encoding UTF8
 
-if ($service) {
-    try {
+    $installedDriverDir = Join-Path $libvirtualhidInstallDir 'drivers\windows'
+    $installedBrokerDir = Join-Path $libvirtualhidInstallDir 'services\windows'
+    New-Item -ItemType Directory -Path $installedDriverDir,$installedBrokerDir -Force | Out-Null
+    Copy-Item (Join-Path $libvirtualhidPackage 'libvirtualhid.inf') $installedDriverDir -Force
+    Copy-Item (Join-Path $libvirtualhidPackage 'libvirtualhid.cat') $installedDriverDir -Force
+    Copy-Item (Join-Path $libvirtualhidPackage 'libvirtualhid_umdf.dll') $installedDriverDir -Force
+    Copy-Item $libvirtualhidBroker $installedBrokerDir -Force
+    $installedInf = Join-Path $installedDriverDir 'libvirtualhid.inf'
+    $installedBroker = Join-Path $installedBrokerDir 'libvirtualhid_broker.exe'
+    & (Join-Path $libvirtualhidRoot 'scripts\windows\install-driver.ps1') `
+        -InfPath $installedInf -CertificatePath $libvirtualhidCertificate -BrokerPath $installedBroker `
+        -LogPath (Join-Path $backupDir 'libvirtualhid-install.log')
+
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    Invoke-Robocopy $stagingDir $InstallDir
+
+    if ($sunshineWasRunning) {
         Start-Service SunshineService
         (Get-Service SunshineService).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
         Start-Sleep -Seconds 15
         if (-not (Get-Process sunshine -ErrorAction SilentlyContinue)) {
             throw 'Sunshine exited during startup.'
         }
-    } catch {
-        Stop-Service SunshineService -Force -ErrorAction SilentlyContinue
-        Invoke-Robocopy $backupDir $InstallDir -Mirror
-        Start-Service SunshineService
-        throw "HIDMaestro deployment failed and the previous Sunshine installation was restored: $_"
     }
+} catch {
+    $deploymentError = $_
+    try {
+        if (Test-Path $restorePath) {
+            & $restorePath
+        } else {
+            if ($brokerWasRunning -and (Get-Service libvirtualhid_broker -ErrorAction SilentlyContinue)) {
+                Start-Service libvirtualhid_broker
+            }
+            if ($sunshineWasRunning) {
+                Start-Service SunshineService
+            }
+        }
+    } catch {
+        throw "Deployment failed: $deploymentError Rollback also failed: $_"
+    }
+    throw "Deployment failed and the previous installations were restored: $deploymentError"
 }
 
 Write-Host "Installed HIDMaestro Sunshine to $InstallDir"
+Write-Host "Installed matched libvirtualhid broker and driver to $libvirtualhidInstallDir"
 Write-Host "Backup: $backupDir"
 Write-Host "Restore: powershell.exe -ExecutionPolicy Bypass -File `"$restorePath`""

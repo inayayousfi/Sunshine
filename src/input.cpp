@@ -1568,6 +1568,18 @@ namespace input {
   };
 
   /**
+   * @brief Add signed 16-bit values when their sum remains representable.
+   *
+   * @param left First value.
+   * @param right Second value.
+   * @param result Receives the sum when it is representable.
+   * @return True when the addition did not overflow.
+   */
+  bool add_batch_value(short left, short right, short &result) {
+    return !__builtin_add_overflow(left, right, &result);
+  }
+
+  /**
    * @brief Batch two relative mouse messages.
    * @param dest The original packet to batch into.
    * @param src A later packet to attempt to batch.
@@ -1578,10 +1590,10 @@ namespace input {
     short deltaY;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
+    if (!add_batch_value(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), deltaX)) {
       return batch_result_e::terminate_batch;
     }
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
+    if (!add_batch_value(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), deltaY)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1618,7 +1630,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
+    if (!add_batch_value(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1638,7 +1650,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
+    if (!add_batch_value(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1646,6 +1658,20 @@ namespace input {
     dest->scrollAmount = util::endian::big(scrollAmt);
     return batch_result_e::batched;
   }
+
+#ifdef SUNSHINE_TESTS
+  bool testing::batch_relative_mouse(std::int16_t dest_x, std::int16_t dest_y, std::int16_t src_x, std::int16_t src_y, std::int16_t &result_x, std::int16_t &result_y) {
+    return add_batch_value(dest_x, src_x, result_x) && add_batch_value(dest_y, src_y, result_y);
+  }
+
+  bool testing::batch_vertical_scroll(std::int16_t dest, std::int16_t src, std::int16_t &result) {
+    return add_batch_value(dest, src, result);
+  }
+
+  bool testing::batch_horizontal_scroll(std::int16_t dest, std::int16_t src, std::int16_t &result) {
+    return add_batch_value(dest, src, result);
+  }
+#endif
 
   /**
    * @brief Batch two controller state messages.
@@ -1844,7 +1870,7 @@ namespace input {
    */
   void passthrough_next_message(std::shared_ptr<input_t> input) {
     // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
+    std::vector<std::uint8_t> entry;
     PNV_INPUT_HEADER payload;
 
     // Lock the input queue while batching, but release it before sending
@@ -1859,7 +1885,7 @@ namespace input {
       }
 
       // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
+      entry = std::move(input->input_queue.front());
       payload = (PNV_INPUT_HEADER) entry.data();
       input->input_queue.pop_front();
 

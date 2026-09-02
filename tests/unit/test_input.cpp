@@ -120,3 +120,26 @@ TEST_F(InputGamepadSessionTest, RefreshesSharedVirtualInputAfterLicenseStateChan
   EXPECT_NE(context().mouse->device_id(), original_mouse_id);
   EXPECT_EQ(runtime().active_device_count(), active_devices);
 }
+
+TEST(InputBatchingTest, BatchesRelativeMouseMovementWithoutOverflow) {
+  std::int16_t result_x = 0;
+  std::int16_t result_y = 0;
+
+  EXPECT_TRUE(input::testing::batch_relative_mouse(100, -200, 300, -400, result_x, result_y));
+  EXPECT_EQ(result_x, 400);
+  EXPECT_EQ(result_y, -600);
+  EXPECT_FALSE(input::testing::batch_relative_mouse(INT16_MAX, 0, 1, 0, result_x, result_y));
+  EXPECT_FALSE(input::testing::batch_relative_mouse(0, INT16_MIN, 0, -1, result_x, result_y));
+}
+
+TEST(InputBatchingTest, BatchesWheelMovementWithoutOverflow) {
+  std::int16_t result = 0;
+
+  EXPECT_TRUE(input::testing::batch_vertical_scroll(120, 240, result));
+  EXPECT_EQ(result, 360);
+  EXPECT_FALSE(input::testing::batch_vertical_scroll(INT16_MAX, 1, result));
+
+  EXPECT_TRUE(input::testing::batch_horizontal_scroll(-120, -240, result));
+  EXPECT_EQ(result, -360);
+  EXPECT_FALSE(input::testing::batch_horizontal_scroll(INT16_MIN, -1, result));
+}

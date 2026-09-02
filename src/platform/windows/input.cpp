@@ -18,6 +18,7 @@
 
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -769,7 +770,8 @@ namespace platf {
     virtualhid::move_mouse(input->virtualhid, deltaX, deltaY);
 #else
     auto &mouse = input->mouse;
-    if (mouse.relative(mouse.handle, deltaX, deltaY) != 0) {
+    const auto result = mouse.relative(mouse.handle, deltaX, deltaY);
+    if (result != 0) {
       BOOST_LOG(error) << "Unable to submit HIDMaestro relative mouse movement: "sv << mouse.message();
     }
 #endif
@@ -780,7 +782,8 @@ namespace platf {
     virtualhid::abs_mouse(input->virtualhid, touch_port, x, y);
 #else
     auto &mouse = input->mouse;
-    if (mouse.absolute(mouse.handle, hidmaestro::normalize_absolute(x, touch_port.width), hidmaestro::normalize_absolute(y, touch_port.height)) != 0) {
+    const auto result = mouse.absolute(mouse.handle, hidmaestro::normalize_absolute(x, touch_port.width), hidmaestro::normalize_absolute(y, touch_port.height));
+    if (result != 0) {
       BOOST_LOG(error) << "Unable to submit HIDMaestro absolute mouse movement: "sv << mouse.message();
     }
 #endif
@@ -797,7 +800,8 @@ namespace platf {
     }
 
     auto &mouse = input->mouse;
-    if (mouse.button(mouse.handle, converted, release ? 0 : 1) != 0) {
+    const auto result = mouse.button(mouse.handle, converted, release ? 0 : 1);
+    if (result != 0) {
       BOOST_LOG(error) << "Unable to submit HIDMaestro mouse button: "sv << mouse.message();
     }
 #endif

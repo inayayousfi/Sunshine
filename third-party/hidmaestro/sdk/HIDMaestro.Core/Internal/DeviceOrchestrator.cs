@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Win32;
@@ -15,35 +14,9 @@ internal static class DeviceOrchestrator
     private const uint EventModifyState = 0x0002;
     private static readonly object GatesLock = new();
     private static readonly Dictionary<int, ManualResetEventSlim> TeardownGates = new();
-    private static readonly bool DiagnosticsEnabled =
-        Environment.GetEnvironmentVariable("HIDMAESTRO_DIAG") == "1";
-    private static readonly object DiagnosticsLock = new();
-    private static StreamWriter? s_diagnostics;
     private static bool s_ghostsCleaned;
 
     private static string RegistryPath(int index) => $@"{RegistryBase}\Controller{index}";
-
-    internal static void LogDiag(string message)
-    {
-        if (!DiagnosticsEnabled) return;
-        lock (DiagnosticsLock)
-        {
-            try
-            {
-                if (s_diagnostics == null)
-                {
-                    string directory = Path.Combine(Path.GetTempPath(), "HIDMaestro");
-                    Directory.CreateDirectory(directory);
-                    var stream = new FileStream(Path.Combine(directory, "teardown_diag.log"),
-                        FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-                    s_diagnostics = new StreamWriter(stream) { AutoFlush = true };
-                }
-                s_diagnostics.WriteLine(
-                    $"[{DateTime.Now:HH:mm:ss.fff}] tid={Environment.CurrentManagedThreadId} {message}");
-            }
-            catch { }
-        }
-    }
 
     public static string? SetupController(
         int controllerIndex, ControllerProfile profile, string infPath)
@@ -122,10 +95,7 @@ internal static class DeviceOrchestrator
                     DeviceManager.RemoveDevice(instanceId, timeoutMs: 120_000,
                         forceFallbacks: true);
                 }
-                catch (Exception error)
-                {
-                    LogDiag($"parent removal failed for {instanceId}: {error.Message}");
-                }
+                catch { }
             }
 
             foreach (string child in children)

@@ -125,22 +125,15 @@ typedef struct _DEVICE_CONTEXT {
     PVOID   SharedMemPtr;        /* MapViewOfFile pointer */
     ULONG   SharedMemSeqNo;      /* Last sequence number we processed */
 
-    /* Sequence-number gate for IOCTL_HID_READ_REPORT. The READ_REPORT
-     * handler returns a cached input report immediately ONLY when there's
-     * new data since the last delivery (SharedMemSeqNo > LastDeliveredSeqNo).
-     * Otherwise the request is parked in ManualQueue and the worker thread
-     * completes it on the next ProcessSharedInput tick. Without this gate,
-     * HIDClass hammers READ_REPORT in a tight loop because every call
-     * returns instantly with stale data — the original CPU saturation
-     * culprit. */
-    ULONG   LastDeliveredInputSeqNo;
-
-    /* Event-driven IPC: SDK signals InputDataEvent after every seqlock write,
-     * the worker thread (WorkerThread) waits on (StopEvent, InputDataEvent)
-     * and processes frames. Replaces the old 1ms WdfTimer busy-poll which
-     * saturated CPU cores at scale. A 50 ms safety timeout on WaitForMultiple
-     * Objects keeps things moving if a signal is ever dropped. */
-    HANDLE  InputDataEvent;      /* OpenEvent on Global\HIDMaestroInputEvent<N> */
+    /* Event-driven IPC: the SDK signals InputDataEvent after publishing a
+     * queue slot, and ReadRequestEvent wakes the worker for parked HID reads.
+     * The worker waits on both events plus StopEvent. This replaces the old
+     * 1 ms WdfTimer busy-poll which saturated CPU cores at scale; a 500 ms
+     * safety timeout also checks for queued work if a signal is dropped. */
+    HANDLE  InputDataEvent;      /* OpenEvent on Global\HIDMaestroInputQueueEvent<N> */
+    HANDLE  InputSpaceEvent;     ///< Signals the SDK after the driver consumes a queue slot.
+    HANDLE  ReadRequestEvent;    ///< Stable local wake for newly parked HID reads.
+    HANDLE  InputPacingTimer;    ///< High-resolution timer for queued HID report cadence.
     HANDLE  StopEvent;            /* Named: Global\HIDMaestroStopEvent<N> */
     volatile LONG TearingDown;   /* issue #38: set by EvtDeviceContextCleanup
                                   * BEFORE it signals StopEvent. StopEvent is
@@ -153,7 +146,8 @@ typedef struct _DEVICE_CONTEXT {
                                   * (reset + recycle), so a live device can
                                   * never be left worker-less. */
     HANDLE  WorkerThread;        /* CreateThread handle */
-    WCHAR   InputEventName[64];  /* e.g. L"Global\\HIDMaestroInputEvent0" */
+    WCHAR   InputEventName[64];  /* e.g. L"Global\\HIDMaestroInputQueueEvent0" */
+    WCHAR   InputSpaceEventName[64]; /* e.g. L"Global\\HIDMaestroInputQueueSpaceEvent0" */
     WCHAR   StopEventName[64];   /* e.g. L"Global\\HIDMaestroStopEvent0" */
     WCHAR   OutputEventName[64]; /* e.g. L"Global\\HIDMaestroOutputEvent0" */
 
@@ -167,7 +161,7 @@ typedef struct _DEVICE_CONTEXT {
     /* Multi-instance: controller index (0, 1, 2, 3) */
     ULONG   ControllerIndex;
     WCHAR   ConfigRegPath[64];      /* e.g. L"SOFTWARE\\HIDMaestro\\Controller0" */
-    WCHAR   SharedMappingName[64];  /* e.g. L"Global\\HIDMaestroInput0" */
+    WCHAR   SharedMappingName[64];  /* e.g. L"Global\\HIDMaestroInputQueue0" */
     WCHAR   OutputMappingName[64];  /* e.g. L"Global\\HIDMaestroOutput0" */
 
     /* Output channel — host→device pass-through (rumble, haptics, FFB, LED).
@@ -244,9 +238,11 @@ typedef struct _DEVICE_CONTEXT {
 
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
-/* Shared memory layout: written by user-mode, read by driver
- * Contains BOTH native HID report data AND GIP data for XUSB GET_STATE.
- * Total size: 4 + 4 + 256 + 14 = 278 bytes.
+/**
+ * @brief Shared input queue written by user mode and drained by the driver.
+ *
+ * Head is the last published sequence and Tail is the last consumed sequence.
+ * The producer never overwrites a slot while Head - Tail equals the capacity.
  *
  * Data[] is 256 bytes to cover every HID input report size in the profile
  * database without truncation. DualSense BT report 0x31 is 78 bytes;
@@ -254,19 +250,31 @@ typedef struct _DEVICE_CONTEXT {
  * passthrough on these pads writes motion values LATE in the report, so
  * the prior 64-byte pipe clipped exactly the motion fields consumers
  * (Dolphin, Cemu, yuzu/Citron, RetroArch) need. 256 matches the mirror
- * in SHARED_OUTPUT and gives headroom for custom profile descriptors. */
+ * in SHARED_OUTPUT and gives headroom for custom profile descriptors.
+ */
+#define HIDMAESTRO_INPUT_RING_SLOTS 64u
+
 #pragma pack(push, 1)
-typedef struct _HIDMAESTRO_SHARED_INPUT {
-    volatile ULONG  SeqNo;           /* Incremented each write */
-    ULONG           DataSize;        /* HID input report data size (excluding Report ID) */
-    UCHAR           Data[256];       /* HID input report data (native descriptor format) */
-    UCHAR           GipData[14];     /* GIP-format data for XUSB GET_STATE (always 14 bytes) */
+typedef struct _HIDMAESTRO_INPUT_SLOT {
+    volatile ULONG  SeqNo;           ///< Expected sequence for this slot.
+    ULONG           DataSize;        ///< HID input report data size, excluding the report ID.
+    UCHAR           Data[256];       ///< HID input report data in native descriptor format.
+    UCHAR           GipData[14];     ///< GIP-format data for XUSB GET_STATE.
     /* v1.3.5 — vendor-blob mode-switch path. Driver passes
      * ExtendedReportData verbatim when ExtendedReportSize > 0. */
     ULONG           ExtendedReportSize;
     UCHAR           ExtendedReportData[80];
+} HIDMAESTRO_INPUT_SLOT, *PHIDMAESTRO_INPUT_SLOT;
+
+typedef struct _HIDMAESTRO_SHARED_INPUT {
+    volatile ULONG  Head;             ///< Last sequence published by the SDK.
+    volatile ULONG  Tail;             ///< Last sequence consumed by the driver.
+    HIDMAESTRO_INPUT_SLOT Slots[HIDMAESTRO_INPUT_RING_SLOTS];  ///< Ordered report slots.
 } HIDMAESTRO_SHARED_INPUT, *PHIDMAESTRO_SHARED_INPUT;
 #pragma pack(pop)
+
+C_ASSERT(sizeof(HIDMAESTRO_INPUT_SLOT) == 362);
+C_ASSERT(sizeof(HIDMAESTRO_SHARED_INPUT) == 23176);
 
 /* Output passthrough section: written by driver/companion, read by consumer.
  * Game sends rumble/haptics/FFB → we capture bytes and publish here.

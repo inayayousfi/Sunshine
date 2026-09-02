@@ -55,6 +55,7 @@ internal sealed class NativeMouseHandle : IDisposable
             ThrowIfDisposed();
             _mouse.SubmitAbsoluteMouseState(new HMAbsoluteMouseState
             {
+                Buttons = _buttons,
                 X = (ushort)Math.Clamp(x, 0, 32767),
                 Y = (ushort)Math.Clamp(y, 0, 32767),
             });

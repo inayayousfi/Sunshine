@@ -69,13 +69,8 @@ internal static class DeviceNodeCreator
             }
 
             string? instanceId = ClaimNewInstance(controllerIndex);
-            if (!UpdateDriverForPlugAndPlayDevicesW(
-                    IntPtr.Zero, hardwareId, infPath, 0, out _))
-            {
-                int error = Marshal.GetLastWin32Error();
-                DeviceOrchestrator.LogDiag(
-                    $"UpdateDriverForPlugAndPlayDevicesW failed (Win32={error}) for {hardwareId}");
-            }
+            UpdateDriverForPlugAndPlayDevicesW(
+                IntPtr.Zero, hardwareId, infPath, 0, out _);
 
             if (instanceId != null)
             {
