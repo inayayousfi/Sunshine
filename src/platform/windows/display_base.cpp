@@ -490,22 +490,50 @@ namespace platf::dxgi {
 
     adapter_t::pointer adapter_p;
     for (int tries = 0; tries < 2; ++tries) {
-      for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+      for (int x = 0;; ++x) {
+        adapter_p = nullptr;
+        status = factory->EnumAdapters1(x, &adapter_p);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status)) {
+          BOOST_LOG(warning) << "Failed to enumerate DXGI adapter [0x"sv << util::hex(status).to_string_view() << ']';
+          break;
+        }
+
         dxgi::adapter_t adapter_tmp {adapter_p};
 
         DXGI_ADAPTER_DESC1 adapter_desc;
-        adapter_tmp->GetDesc1(&adapter_desc);
+        status = adapter_tmp->GetDesc1(&adapter_desc);
+        if (FAILED(status)) {
+          BOOST_LOG(warning) << "Failed to describe DXGI adapter [0x"sv << util::hex(status).to_string_view() << ']';
+          continue;
+        }
 
         if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
           continue;
         }
 
         dxgi::output_t::pointer output_p;
-        for (int y = 0; adapter_tmp->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        for (int y = 0;; ++y) {
+          output_p = nullptr;
+          status = adapter_tmp->EnumOutputs(y, &output_p);
+          if (status == DXGI_ERROR_NOT_FOUND) {
+            break;
+          }
+          if (FAILED(status)) {
+            BOOST_LOG(warning) << "Failed to enumerate DXGI output [0x"sv << util::hex(status).to_string_view() << ']';
+            break;
+          }
+
           dxgi::output_t output_tmp {output_p};
 
           DXGI_OUTPUT_DESC desc;
-          output_tmp->GetDesc(&desc);
+          status = output_tmp->GetDesc(&desc);
+          if (FAILED(status)) {
+            BOOST_LOG(warning) << "Failed to describe DXGI output [0x"sv << util::hex(status).to_string_view() << ']';
+            continue;
+          }
 
           if (!output_name.empty() && desc.DeviceName != output_name) {
             continue;
@@ -1072,10 +1100,24 @@ namespace platf {
     }
 
     dxgi::adapter_t::pointer adapter_p;
-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+    for (int x = 0;; ++x) {
+      adapter_p = nullptr;
+      status = factory->EnumAdapters1(x, &adapter_p);
+      if (status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to enumerate DXGI adapter [0x"sv << util::hex(status).to_string_view() << ']';
+        return {};
+      }
+
       dxgi::adapter_t adapter {adapter_p};
       DXGI_ADAPTER_DESC1 adapter_desc;
-      adapter->GetDesc1(&adapter_desc);
+      status = adapter->GetDesc1(&adapter_desc);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to describe DXGI adapter [0x"sv << util::hex(status).to_string_view() << ']';
+        return {};
+      }
 
       BOOST_LOG(debug)
         << std::endl
@@ -1090,11 +1132,25 @@ namespace platf {
         << "    ====== OUTPUT ======"sv << std::endl;
 
       dxgi::output_t::pointer output_p {};
-      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+      for (int y = 0;; ++y) {
+        output_p = nullptr;
+        status = adapter->EnumOutputs(y, &output_p);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to enumerate DXGI output [0x"sv << util::hex(status).to_string_view() << ']';
+          return {};
+        }
+
         dxgi::output_t output {output_p};
 
         DXGI_OUTPUT_DESC desc;
-        output->GetDesc(&desc);
+        status = output->GetDesc(&desc);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to describe DXGI output [0x"sv << util::hex(status).to_string_view() << ']';
+          return {};
+        }
 
         auto device_name = utf_utils::to_utf8(desc.DeviceName);
 

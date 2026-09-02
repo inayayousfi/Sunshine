@@ -304,7 +304,7 @@ namespace platf::dxgi {
      *
      * @param config Configuration values to apply.
      * @param display_name Display name.
-     * @return 0 on success; nonzero or negative platform status on failure.
+     * @return 0 on success; nonzero or negative platform status when display enumeration or initialization fails.
      */
     int init(const ::video::config_t &config, const std::string &display_name);
 

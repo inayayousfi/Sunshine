@@ -924,7 +924,7 @@ namespace platf {
    * @brief List display names accepted by the selected capture backend.
    *
    * @param hwdevice_type Hardware device type requested for capture or encode.
-   * @return Display names accepted by the selected capture backend.
+   * @return Display names accepted by the selected capture backend, or an empty list if enumeration fails.
    */
   std::vector<std::string> display_names(mem_type_e hwdevice_type);
 
