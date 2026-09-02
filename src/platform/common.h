@@ -1126,7 +1126,7 @@ namespace platf {
   /**
    * @brief Create the platform input backend for a stream.
    *
-   * @return Platform-specific input backend for the active stream.
+   * @return Platform-specific input backend, or null when mandatory initialization fails.
    */
   input_t input();
   /**

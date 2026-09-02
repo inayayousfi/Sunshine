@@ -2,6 +2,11 @@
 
 add_compile_definitions(SUNSHINE_PLATFORM="windows")
 
+set(HIDMAESTRO_MOUSE_DLL "" CACHE FILEPATH "Path to the mandatory HIDMaestro NativeAOT mouse DLL")
+if(NOT EXISTS "${HIDMAESTRO_MOUSE_DLL}")
+    message(FATAL_ERROR "HIDMAESTRO_MOUSE_DLL must name a built HIDMaestro.NativeMouse.dll")
+endif()
+
 enable_language(RC)
 set(CMAKE_RC_COMPILER windres)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
@@ -66,6 +71,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/publish.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/hidmaestro_mouse.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/input.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_base.cpp"

@@ -528,6 +528,8 @@ Thank you to all the contributors who have helped make Sunshine better!
 |:---------|-------------------------------------------:|
 |          | [Getting Started](docs/getting_started.md) |
 
+Windows fork builds can use the [HIDMaestro mouse backend](docs/hidmaestro_mouse.md).
+
 </div>
 
 <details style="display: none;">

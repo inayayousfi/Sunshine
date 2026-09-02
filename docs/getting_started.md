@@ -478,10 +478,10 @@ and enter its device name in the [audio_sink](configuration.md#audio_sink) field
 > Gamepads are not currently supported.
 
 ### Windows
-Sunshine uses libvirtualhid for virtual input on Windows. You must install the
-[Virtual HID Driver](https://github.com/LizardByte/libvirtualhid/releases/latest) separately for a driver-backed Raw
-Input keyboard and mouse plus full virtual gamepad support. ViGEmBus is detected only as a limited fallback for Xbox
-360 and DualShock 4 gamepads when libvirtualhid is unavailable.
+This fork uses HIDMaestro for mouse input and libvirtualhid for keyboard and gamepad input on Windows. You must install
+the [Virtual HID Driver](https://github.com/LizardByte/libvirtualhid/releases/latest) separately for a driver-backed Raw
+Input keyboard and full virtual gamepad support. ViGEmBus is detected only as a limited fallback for Xbox 360 and
+DualShock 4 gamepads when libvirtualhid is unavailable.
 
 Sunshine requires Virtual HID Driver version `2026.829.2338.54` or newer. Earlier releases use incompatible Windows
 control and broker protocols and must be upgraded together with Sunshine's embedded libvirtualhid library. Local
@@ -497,15 +497,16 @@ applications using Raw Input can receive them. Unicode text input and keys outsi
 continue to use Windows input injection. When the driver-backed keyboard cannot be created because the driver,
 broker, or license is unavailable, libvirtualhid retains its legacy SendInput fallback.
 
-Relative mouse movement, buttons, and scrolling are exposed as a real HID
-mouse so applications using Raw Input can receive them. Absolute mouse positioning continues to use Windows input
-injection. When the driver-backed mouse cannot be created, libvirtualhid retains its legacy SendInput fallback.
+Relative and absolute mouse movement, buttons, and scrolling use the mandatory HIDMaestro virtual mouse so applications
+using Raw Input can receive them. A missing NativeMouse DLL, export, driver, or virtual device aborts Sunshine startup;
+there is no libvirtualhid or SendInput mouse fallback. See the [HIDMaestro mouse backend](hidmaestro_mouse.md) for build,
+deployment, and restore details.
 
-The Virtual HID Driver requires an active machine license for driver-backed devices, including gamepads and the Raw
-Input keyboard and mouse. Sunshine shows the current license status and actions on the Web UI Troubleshooting page and
-in the **Virtual HID Driver** system tray submenu. When Sunshine starts on an unactivated machine, select its tray
-notification to open the activation and purchase options in the Web UI. Sunshine recreates the shared keyboard and
-mouse after a successful license action, so switching between the HID and SendInput paths does not require restarting
+The Virtual HID Driver requires an active machine license for its driver-backed keyboard and gamepad devices. The
+HIDMaestro mouse does not use that license. Sunshine shows the Virtual HID Driver license status and actions on the Web
+UI Troubleshooting page and in the **Virtual HID Driver** system tray submenu. When Sunshine starts on an unactivated
+machine, select its tray notification to open the activation and purchase options in the Web UI. Sunshine recreates the
+shared keyboard after a successful license action, so switching its HID and SendInput paths does not require restarting
 Sunshine.
 
 After installing or updating virtual input drivers, it is recommended to restart your computer.

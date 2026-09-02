@@ -402,6 +402,10 @@ int main(int argc, char *argv[]) {
 
   reed_solomon_init();
   auto input_deinit_guard = input::init();
+  if (!input_deinit_guard) {
+    BOOST_LOG(fatal) << "Input failed to initialize"sv;
+    return 1;
+  }
 
   if (input::probe_gamepads()) {
     BOOST_LOG(warning) << "No gamepad input is available"sv;
